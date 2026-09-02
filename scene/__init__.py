@@ -13,10 +13,11 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
+from scene.dataset_readers import sceneLoadTypeCallbacks, getNerfppNorm
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.view_selection import select_uniform
 
 class Scene:
 
@@ -47,6 +48,21 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
         else:
             assert False, "Could not recognize scene type!"
+
+        selected_train_cameras = select_uniform(
+            scene_info.train_cameras, args.max_train_views, args.view_stride
+        )
+        if len(selected_train_cameras) != len(scene_info.train_cameras):
+            if len(selected_train_cameras) < 2:
+                raise ValueError("Sparse-view selection left fewer than two cameras")
+            print(
+                f"Sparse-view mode: using {len(selected_train_cameras)} of "
+                f"{len(scene_info.train_cameras)} training views"
+            )
+            scene_info = scene_info._replace(
+                train_cameras=selected_train_cameras,
+                nerf_normalization=getNerfppNorm(selected_train_cameras),
+            )
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:

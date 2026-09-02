@@ -22,6 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.importance_utils import load_importance_mask, weighted_l1
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,7 +41,9 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations,
+             checkpoint, debug_from, importance_mask_dir="", foreground_weight=4.0,
+             background_weight=0.25):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -67,6 +70,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    importance_cache = {}
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -117,7 +121,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+        importance_mask = load_importance_mask(
+            importance_mask_dir, viewpoint_cam.image_name, image.shape[-2:],
+            image.device, importance_cache
+        )
+        if importance_mask is None:
+            Ll1 = l1_loss(image, gt_image)
+        else:
+            Ll1 = weighted_l1(
+                image, gt_image, importance_mask,
+                foreground_weight=foreground_weight,
+                background_weight=background_weight,
+            )
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
@@ -267,6 +282,12 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument(
+        "--importance_mask_dir", type=str, default="",
+        help="Optional grayscale masks named after input images"
+    )
+    parser.add_argument("--foreground_weight", type=float, default=4.0)
+    parser.add_argument("--background_weight", type=float, default=0.25)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -279,7 +300,18 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    if args.importance_mask_dir:
+        args.importance_mask_dir = os.path.abspath(args.importance_mask_dir)
+        if not os.path.isdir(args.importance_mask_dir):
+            parser.error(f"Importance mask directory does not exist: {args.importance_mask_dir}")
+    if args.foreground_weight <= 0 or args.background_weight <= 0:
+        parser.error("Importance weights must be positive")
+    training(
+        lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations,
+        args.save_iterations, args.checkpoint_iterations, args.start_checkpoint,
+        args.debug_from, args.importance_mask_dir, args.foreground_weight,
+        args.background_weight
+    )
 
     # All done
     print("\nTraining complete.")

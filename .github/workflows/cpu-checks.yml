@@ -1,0 +1,20 @@
+name: CPU checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python -m pip install numpy
+      - run: python -m unittest discover -s tests -v
+      - run: >-
+          python -m compileall -q arguments gaussian_renderer scene semantic scripts
+          train.py train_semantics.py preprocess_semantics.py semantic_query.py
+          semantic_edit.py semantic_inspect.py semantic_viewer.py gaussian_transform.py

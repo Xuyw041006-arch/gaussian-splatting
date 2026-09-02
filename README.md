@@ -1,4 +1,222 @@
-# 3D Gaussian Splatting for Real-Time Radiance Field Rendering
+# Semantic-Adaptive 3D Gaussian Splatting
+
+这是基于 Graphdeco 官方 `gaussian-splatting` 主分支的可运行扩展，不是 LaGa，也不是模拟点云。RGB 训练、CUDA 光栅化、COLMAP 数据读取、深度正则化和 SIBR Viewer 都来自原始 3DGS；本仓库新增开放词汇语义、重要区域加权、稀疏视角配置、文本搜索、非破坏性删除和点击检查。
+
+> 使用范围继承上游 [LICENSE.md](LICENSE.md)：仅限非商业研究与评估。
+
+## 已实现的闭环
+
+1. **自建数据**：普通照片复制到标准目录，COLMAP 自动计算相机与稀疏点云。
+2. **重要物体优先**：用户或 LLM 给出 `apple,cup` 等重要词；SAM+CLIP 生成每张图的前景权重图，RGB 训练提高前景损失、降低背景损失。
+3. **开放词汇语义**：SAM 区域的 CLIP 特征经 PCA 压缩为监督图，再通过官方 Gaussian Rasterizer 蒸馏到每个训练完成的高斯点。
+4. **少图模式**：可均匀限制训练视角，并复用官方主分支的单目深度正则化；对视频帧支持 sequential COLMAP matcher。
+5. **搜索和编辑**：文本查询返回全部匹配高斯、数量、中心和包围盒；可导出命中点云，或生成删除/仅保留目标的新模型。
+6. **交互检查**：浏览器 UI 可输入文本、查看所有命中点并点击已注册视图中的物体；官方 SIBR Viewer 继续负责自由三维导航。
+
+## 目录
+
+```text
+preprocess_semantics.py       SAM + CLIP + PCA + 重要区域掩码
+train.py                      官方 RGB 训练（新增 importance loss）
+train_semantics.py            语义特征蒸馏到固定 3D Gaussians
+semantic_query.py             “找到所有苹果”
+semantic_edit.py              删除/仅保留查询结果，源模型不改
+gaussian_transform.py         移动/旋转/缩放全部或语义选中高斯
+semantic_inspect.py           指定视图与像素，返回点和语义信息
+semantic_viewer.py            文本搜索 + 鼠标点击 Web UI
+scripts/prepare_dataset.py    自建图片目录导入
+scripts/run_pipeline.py       完整流水线与 dry-run
+scripts/preflight.py          环境/数据/检查点诊断
+semantic/                     查询、投影和拾取的公共逻辑
+tests/                        无 GPU 单元与命令规划测试
+```
+
+## 1. 安装
+
+要求 Linux、NVIDIA GPU、CUDA；建议显存 12 GB 以上。先递归克隆，再按官方环境安装：
+
+```bash
+git clone --recursive https://github.com/Xuyw041006-arch/gaussian-splatting.git
+cd gaussian-splatting
+conda env create --file environment.yml
+conda activate gaussian_splatting
+pip install -r requirements-semantic.txt
+pip install -r requirements-ui.txt
+```
+
+下载与 `--sam_model` 一致的 Segment Anything 检查点。快速测试推荐体积较小的 `sam_vit_b_01ec64.pth`。
+
+## 2. 自建数据
+
+拍摄建议：围绕场景移动、相邻图像保持 60% 以上重叠、避免纯旋转和运动模糊；少图模式建议至少 8 张。
+
+```bash
+python scripts/prepare_dataset.py \
+  --images /data/my_photos \
+  --scene /data/my_scene
+```
+
+视频抽帧请先用 ffmpeg，再把抽帧目录传给上面的命令。顺序视频帧在流水线中使用 `--matcher sequential`。
+
+## 3. 先检查，不训练
+
+```bash
+python scripts/preflight.py \
+  --scene /data/my_scene \
+  --sam_checkpoint /checkpoints/sam_vit_b_01ec64.pth
+
+python scripts/run_pipeline.py \
+  --scene /data/my_scene \
+  --model output/my_scene \
+  --sam_checkpoint /checkpoints/sam_vit_b_01ec64.pth \
+  --important "apple,cup" \
+  --sparse --max_train_views 8 \
+  --dry_run
+```
+
+`--dry_run` 只打印四个真实命令，不生成模型。
+
+## 4. GPU 冒烟测试
+
+冒烟测试只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
+
+```bash
+python scripts/run_pipeline.py \
+  --scene /data/my_scene \
+  --model output/my_scene_smoke \
+  --sam_checkpoint /checkpoints/sam_vit_b_01ec64.pth \
+  --important "apple,cup" \
+  --scene_iterations 100 \
+  --semantic_iterations 20 \
+  --feature_width 160 \
+  --sparse --max_train_views 8
+```
+
+成功标准是同时存在：
+
+```text
+output/my_scene_smoke/point_cloud/iteration_100/point_cloud.ply
+output/my_scene_smoke/semantic/iteration_100/semantic_features.pt
+```
+
+正式训练去掉两个小迭代参数，默认 RGB 30,000 次、语义 5,000 次：
+
+```bash
+python scripts/run_pipeline.py \
+  --scene /data/my_scene \
+  --model output/my_scene \
+  --sam_checkpoint /checkpoints/sam_vit_b_01ec64.pth \
+  --important "apple,cup" \
+  --sparse --max_train_views 8 \
+  --resume
+```
+
+### 单目深度增强少图重建
+
+官方主分支已原生支持 Depth Anything V2 深度正则。按下方上游说明生成 `depths/` 和 `sparse/0/depth_params.json` 后，在流水线增加：
+
+```bash
+--depths depths
+```
+
+这会真正把深度损失加入训练，而不是仅修改“稀疏”参数名称。
+
+### 接入 LLM 的逐图重点物体
+
+让任意 LLM 输出一个 JSON 文件即可，不绑定某个云端模型：
+
+```json
+{
+  "IMG_0012.jpg": ["apple", "red cup"],
+  "IMG_0013.jpg": ["apple"],
+  "IMG_0014": ["fruit bowl", "table"]
+}
+```
+
+然后把 `--important "apple,cup"` 换为 `--important_json important_objects.json`。脚本会为每张图分别生成重要区域；JSON 没覆盖的图片使用 `--important` 的全局词表（如同时提供）。
+
+## 5. 搜索、删除与点击
+
+找到场景内所有苹果，并导出命中点云：
+
+```bash
+python semantic_query.py \
+  --model output/my_scene \
+  --text "apple" \
+  --threshold 0.25 \
+  --output output/apples.npz \
+  --export_selected output/apples.ply \
+  --device cpu
+```
+
+删除苹果会创建新模型，绝不覆盖源模型：
+
+```bash
+python semantic_edit.py \
+  --model output/my_scene \
+  --selection output/apples.npz \
+  --output_model output/my_scene_without_apples \
+  --action remove
+```
+
+移动、旋转或缩放刚才找到的苹果，同样输出为新模型：
+
+```bash
+python gaussian_transform.py \
+  --model output/my_scene \
+  --selection output/apples.npz \
+  --output_model output/my_scene_moved_apples \
+  --translate 0.2 0 0 --rotate_z 30 --scale 1.2
+```
+
+在某张注册图像的 `(x, y)` 像素检查对象，并用候选词解释：
+
+```bash
+python semantic_inspect.py \
+  --model output/my_scene \
+  --view IMG_0012.jpg --x 640 --y 420 \
+  --labels "apple,cup,table"
+```
+
+启动可点击 Web UI：
+
+```bash
+python semantic_viewer.py \
+  --model output/my_scene \
+  --source /data/my_scene \
+  --device cpu
+```
+
+浏览器打开 `http://127.0.0.1:7860`。自由旋转、平移和缩放完整高斯场景仍使用官方 SIBR Viewer：
+
+```bash
+./SIBR_viewers/install/bin/SIBR_gaussianViewer_app -m output/my_scene
+```
+
+## 6. 无 GPU 的代码测试
+
+这些测试验证稀疏视角选择、语义数值变换、点击投影、流水线参数和源码可编译性：
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q arguments gaussian_renderer scene semantic scripts \
+  train.py train_semantics.py preprocess_semantics.py \
+  semantic_query.py semantic_edit.py semantic_inspect.py semantic_viewer.py \
+  gaussian_transform.py
+```
+
+无 GPU 测试不能证明 CUDA 扩展或训练可用；必须再执行上面的 GPU 冒烟测试。
+
+## 当前边界
+
+- 语义精度依赖拍摄覆盖、SAM 掩码和 CLIP 文本匹配；阈值需要按场景调整。
+- “删除”是从高斯 PLY 中过滤点，不会生成被遮挡背景；删除大物体后可能留下空洞。
+- 点击拾取依据已注册相机上的高斯中心投影，是轻量近似，不是逐像素 ID-buffer。
+- 极少于 6–8 张图时，COLMAP 本身可能无法估计可靠相机；深度先验可以改善几何，但不能保证恢复未观测区域。
+
+---
+
+# Upstream: 3D Gaussian Splatting for Real-Time Radiance Field Rendering
 Bernhard Kerbl*, Georgios Kopanas*, Thomas Leimkühler, George Drettakis (* indicates equal contribution)<br>
 | [Webpage](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) | [Full Paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/3d_gaussian_splatting_high.pdf) | [Video](https://youtu.be/T_kXY43VZnk) | [Other GRAPHDECO Publications](http://www-sop.inria.fr/reves/publis/gdindex.php) | [FUNGRAPH project page](https://fungraph.inria.fr) |<br>
 | [T&T+DB COLMAP (650MB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip) | [Pre-trained Models (14 GB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip) | [Viewers for Windows (60MB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/binaries/viewers.zip) | [Evaluation Images (7 GB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/evaluation/images.zip) |<br>
