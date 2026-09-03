@@ -200,9 +200,14 @@ class GaussianModel:
         indices = indices.reshape(-1)
         observations = observations.reshape(-1).to(self.importance_score)
         previous = self.importance_score[indices]
-        self.importance_score[indices] = (
+        averaged = (
             float(momentum) * previous + (1.0 - float(momentum)) * observations
-        ).clamp_(0, 1)
+        )
+        # A user/LLM important label is positive evidence: expose it immediately so
+        # the point can benefit from the next densification pass. Conflicting lower
+        # tiers still decay the score over subsequent views instead of locking it.
+        fused = torch.where(observations > previous, observations, averaged)
+        self.importance_score[indices] = fused.clamp_(0, 1)
 
     def _sh_capacity_mask(self, background_degree=1, normal_degree=3, important_degree=5):
         if self._features_rest.shape[1] == 0:

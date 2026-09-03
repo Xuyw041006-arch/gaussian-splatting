@@ -45,6 +45,20 @@ class JointSemanticSupervisor:
     def map_path(self, camera):
         return self.semantic_dir / f"{Path(camera.image_name).stem}.npz"
 
+    @torch.no_grad()
+    def observe_importance(self, camera, visible_indices):
+        """Fuse tier evidence from every RGB iteration, including semantic warmup."""
+        path = self.map_path(camera)
+        if not path.is_file():
+            return
+        tiers = load_joint_map(str(path))["importance"].cuda(non_blocking=True)
+        indices, observations = project_tiers_to_gaussians(
+            self.gaussians.get_xyz, camera, tiers, visible_indices
+        )
+        self.gaussians.update_importance_score(
+            indices, observations, self.args.importance_ema
+        )
+
     def compute(self, camera, iteration):
         path = self.map_path(camera)
         if iteration < self.args.semantic_start or not path.is_file():
@@ -94,13 +108,6 @@ class JointSemanticSupervisor:
                 spatial_loss = local_semantic_consistency(
                     self.gaussians, self.args.semantic_spatial_samples
                 )
-            indices, observations = project_tiers_to_gaussians(
-                self.gaussians.get_xyz, camera, tiers,
-                semantic_package["visibility_filter"],
-            )
-            self.gaussians.update_importance_score(
-                indices, observations, self.args.importance_ema
-            )
             loss = (
                 self.args.semantic_weight * data_loss
                 + self.args.semantic_spatial_weight

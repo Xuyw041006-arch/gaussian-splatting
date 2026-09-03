@@ -131,6 +131,14 @@ def main():
             if key in results["joint"]
         },
     }
+    for name in ("sequential", "joint"):
+        per_label = results[name]["per_label_iou"]
+        summary[name]["important_mean_iou"] = float(sum(
+            per_label[label] for label in IMPORTANT.split(",")
+        ) / len(IMPORTANT.split(",")))
+        summary[name]["normal_mean_iou"] = float(sum(
+            per_label[label] for label in NORMAL.split(",")
+        ) / len(NORMAL.split(",")))
     summary["delta"] = {
         "gaussians": summary["joint"]["gaussians"] - summary["sequential"]["gaussians"],
         "test_psnr": summary["joint"]["test_psnr"] - summary["sequential"]["test_psnr"],
@@ -139,6 +147,14 @@ def main():
         "mean_boundary_iou": (
             summary["joint"]["mean_boundary_iou"]
             - summary["sequential"]["mean_boundary_iou"]
+        ),
+        "important_mean_iou": (
+            summary["joint"]["important_mean_iou"]
+            - summary["sequential"]["important_mean_iou"]
+        ),
+        "normal_mean_iou": (
+            summary["joint"]["normal_mean_iou"]
+            - summary["sequential"]["normal_mean_iou"]
         ),
     }
     summary_path = output_root / "comparison.json"

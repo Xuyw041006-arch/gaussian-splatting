@@ -126,6 +126,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        if joint is not None:
+            joint.observe_importance(viewpoint_cam, visibility_filter)
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
