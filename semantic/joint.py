@@ -131,15 +131,16 @@ def local_semantic_consistency(gaussians, samples=512):
     indices = torch.multinomial(probability, count, replacement=False)
     xyz = gaussians.get_xyz[indices]
     distance = torch.cdist(xyz, xyz)
-    distance.fill_diagonal_(float("inf"))
-    neighbor_column = distance.argmin(dim=1)
+    diagonal = torch.eye(count, dtype=torch.bool, device=distance.device)
+    search_distance = distance.masked_fill(diagonal, float("inf"))
+    neighbor_column = search_distance.argmin(dim=1)
     neighbors = indices[neighbor_column]
     error = torch.nn.functional.smooth_l1_loss(
         features[indices], features[neighbors], reduction="none"
     ).mean(dim=-1)
-    spatial_scale = distance.gather(1, neighbor_column[:, None]).squeeze(1).median()
+    neighbor_distance = distance.gather(1, neighbor_column[:, None]).squeeze(1)
+    spatial_scale = neighbor_distance.median()
     edge_weight = torch.exp(
-        -distance.gather(1, neighbor_column[:, None]).squeeze(1)
-        / spatial_scale.clamp_min(1e-7)
+        -neighbor_distance / spatial_scale.clamp_min(1e-7)
     )
     return (error * edge_weight).sum() / edge_weight.sum().clamp_min(1e-7)

@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--feature_width", type=int, default=512)
     parser.add_argument("--skip_preprocess", action="store_true")
     parser.add_argument("--skip_training", action="store_true")
+    parser.add_argument("--skip_baseline", action="store_true")
+    parser.add_argument("--skip_joint", action="store_true")
     args = parser.parse_args()
 
     if min(args.iterations, args.semantic_iterations, args.feature_dim) < 1:
@@ -66,32 +68,34 @@ def main():
         "--importance_mask_dir", scene / "importance_masks",
     ]
     if not args.skip_training:
-        run([
-            sys.executable, repo / "train.py", "-m", baseline, *common_train,
-            "--foreground_weight", 3.0, "--background_weight", 0.75,
-        ], repo)
-        run([
-            sys.executable, repo / "train_semantics.py", "-m", baseline,
-            "--iteration", args.iterations,
-            "--semantic_iterations", args.semantic_iterations,
-            "--semantic_lr", 0.005, "--spatial_weight", 0.02,
-            "--spatial_k", 8, "--spatial_samples", 4096,
-        ], repo)
-        run([
-            sys.executable, repo / "train.py", "-m", joint, *common_train,
-            "--joint_semantics", "--semantic_dir", scene / "semantic_maps",
-            "--sh_degree", 5, "--semantic_start", 500,
-            "--semantic_weight", 0.15, "--semantic_lr", 0.005,
-            "--scale_gate_lr", 0.001,
-            "--rgb_tier_weights", 0.35, 1.0, 4.0,
-            "--semantic_tier_weights", 0.15, 1.0, 4.0,
-            "--tier_densify_multipliers", 1.80, 1.0, 0.55,
-            "--tier_opacity_multipliers", 2.0, 1.0, 0.5,
-            "--tier_sh_degrees", 1, 3, 5,
-            "--semantic_spatial_weight", 0.02,
-            "--semantic_spatial_every", 8,
-            "--semantic_spatial_samples", 512,
-        ], repo)
+        if not args.skip_baseline:
+            run([
+                sys.executable, repo / "train.py", "-m", baseline, *common_train,
+                "--foreground_weight", 3.0, "--background_weight", 0.75,
+            ], repo)
+            run([
+                sys.executable, repo / "train_semantics.py", "-m", baseline,
+                "--iteration", args.iterations,
+                "--semantic_iterations", args.semantic_iterations,
+                "--semantic_lr", 0.005, "--spatial_weight", 0.02,
+                "--spatial_k", 8, "--spatial_samples", 4096,
+            ], repo)
+        if not args.skip_joint:
+            run([
+                sys.executable, repo / "train.py", "-m", joint, *common_train,
+                "--joint_semantics", "--semantic_dir", scene / "semantic_maps",
+                "--sh_degree", 5, "--semantic_start", 500,
+                "--semantic_weight", 0.15, "--semantic_lr", 0.005,
+                "--scale_gate_lr", 0.001,
+                "--rgb_tier_weights", 0.35, 1.0, 4.0,
+                "--semantic_tier_weights", 0.15, 1.0, 4.0,
+                "--tier_densify_multipliers", 1.80, 1.0, 0.55,
+                "--tier_opacity_multipliers", 2.0, 1.0, 0.5,
+                "--tier_sh_degrees", 1, 3, 5,
+                "--semantic_spatial_weight", 0.02,
+                "--semantic_spatial_every", 8,
+                "--semantic_spatial_samples", 512,
+            ], repo)
 
     results = {}
     for name, model in (("sequential", baseline), ("joint", joint)):
