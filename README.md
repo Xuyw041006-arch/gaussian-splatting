@@ -287,6 +287,24 @@ python scripts/run_ramen_benchmark.py \
   --output_root output/ramen_ablation
 ```
 
+已在 Colab NVIDIA L4 上完成 1,500 轮 pilot（3 个有标注测试视图，固定
+semantic threshold 0.25）：
+
+| 指标 | 顺序基线 | 联合模型 | 联合 - 基线 |
+|---|---:|---:|---:|
+| 高斯数量 | 94,708 | 52,553 | -44.5% |
+| 全局 PSNR | 26.27 dB | 25.28 dB | -0.99 dB |
+| 重要区域 PSNR | 28.83 dB | 28.61 dB | -0.23 dB |
+| 全局 mIoU | 15.88% | 14.72% | -1.16 pp |
+| 重要类别 mIoU | 10.49% | 12.21% | **+1.72 pp** |
+| Boundary-IoU | 7.21% | 4.00% | -3.21 pp |
+
+联合模型的 22.89% 重要监督像素获得了 44.58% 的最终高斯，证明三级资源分配
+已经工作；但短训练下全局画质和边界质量仍落后，不能宣称全面优于现有方法。
+原始指标见 [`benchmarks/ramen_pilot_1500.json`](benchmarks/ramen_pilot_1500.json)，
+完整公式、阈值、限制和下一轮优化见 [`docs/JOINT_MODEL.md`](docs/JOINT_MODEL.md)。
+论文级对比请在 Notebook 中选择 full 模式运行 15,000/2,000 轮。
+
 ## 当前边界
 
 - 语义精度依赖拍摄覆盖、SAM 掩码和 CLIP 文本匹配；阈值需要按场景调整。

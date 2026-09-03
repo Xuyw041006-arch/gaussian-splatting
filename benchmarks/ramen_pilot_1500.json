@@ -1,0 +1,78 @@
+{
+  "status": "pilot",
+  "date": "2026-09-03",
+  "dataset": "LERF-Mask ramen",
+  "hardware": "NVIDIA L4 23 GB (Google Colab)",
+  "protocol": {
+    "registered_images": 135,
+    "training_images": 131,
+    "held_out_images": 4,
+    "annotated_test_views_scored": 3,
+    "rgb_iterations": 1500,
+    "sequential_semantic_iterations": 300,
+    "joint_semantic_start": 500,
+    "semantic_threshold": 0.25,
+    "semantic_granularity": "middle",
+    "important_labels": [
+      "egg",
+      "pork belly",
+      "wavy noodles in bowl"
+    ],
+    "normal_labels": [
+      "yellow bowl",
+      "chopsticks",
+      "glass of water"
+    ]
+  },
+  "preprocessing": {
+    "sam_regions": 14842,
+    "mean_sam_confidence": 0.939,
+    "cross_view_prototypes": 64,
+    "mean_prototype_blend": 0.45848,
+    "pixel_tier_ratios": {
+      "background": 0.68063,
+      "normal": 0.0905,
+      "important": 0.22887
+    }
+  },
+  "sequential": {
+    "gaussians": 94708,
+    "test_psnr": 26.267061233520508,
+    "test_ssim": 0.8763966957728068,
+    "important_region_psnr": 28.834309260050457,
+    "normal_region_psnr": 26.560951232910156,
+    "mean_iou": 0.15884310971641655,
+    "mean_boundary_iou": 0.072062852276436,
+    "important_mean_iou": 0.10490098815992792,
+    "normal_mean_iou": 0.21278523127290513
+  },
+  "joint": {
+    "gaussians": 52553,
+    "tier_gaussians": {
+      "background": 1297,
+      "normal": 27827,
+      "important": 23429
+    },
+    "test_psnr": 25.279133478800457,
+    "test_ssim": 0.8653343121210734,
+    "important_region_psnr": 28.607821146647137,
+    "normal_region_psnr": 25.789724985758465,
+    "mean_iou": 0.14723806472219295,
+    "mean_boundary_iou": 0.039993529481601335,
+    "important_mean_iou": 0.1220939453610554,
+    "normal_mean_iou": 0.17238218408333048
+  },
+  "joint_minus_sequential": {
+    "gaussians": -42155,
+    "gaussian_ratio": -0.4451039194165277,
+    "test_psnr": -0.9879277547200509,
+    "test_ssim": -0.011062383651733398,
+    "important_region_psnr": -0.2264881134033203,
+    "normal_region_psnr": -0.7712262471516915,
+    "mean_iou": -0.011605044994223601,
+    "mean_boundary_iou": -0.03206932279483466,
+    "important_mean_iou": 0.017192957201127484,
+    "normal_mean_iou": -0.04040304718957466
+  },
+  "interpretation": "The pilot validates priority allocation: important-class mIoU rises and important Gaussians occupy 44.58% of the model for 22.89% of supervised pixels. It does not yet establish better global quality: global PSNR, global mIoU and Boundary-IoU regress at this short budget. Run the 15000/2000 full protocol before making paper-level claims."
+}
