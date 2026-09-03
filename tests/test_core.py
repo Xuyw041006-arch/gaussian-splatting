@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from export_web_bundle import assign_disjoint_indices, read_label_specs
 from semantic.artifact import cosine_scores, decode_features, project_clip_feature, select_indices
 from semantic.inspection import pick_point, project_points
 from utils.view_selection import select_uniform
@@ -47,6 +48,20 @@ class InspectionTests(unittest.TestCase):
     def test_pick_nearest_visible_point(self):
         index = pick_point([[0, 0, 2], [0, 0, 5], [2, 0, -1]], self.camera, 100, 50)
         self.assertEqual(index, 0)
+
+
+class WebBundleTests(unittest.TestCase):
+    def test_label_specs_support_bilingual_metadata(self):
+        specs = read_label_specs("apple,cup", "")
+        self.assertEqual([item["label"] for item in specs], ["apple", "cup"])
+
+    def test_assignment_is_disjoint_and_respects_threshold(self):
+        groups = assign_disjoint_indices(
+            [[0.9, 0.2], [0.3, 0.8], [0.1, 0.2], [0.7, 0.6]], threshold=0.5
+        )
+        self.assertEqual(groups[0].tolist(), [0, 3])
+        self.assertEqual(groups[1].tolist(), [1])
+        self.assertTrue(set(groups[0]).isdisjoint(set(groups[1])))
 
 
 if __name__ == "__main__":

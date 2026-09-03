@@ -13,7 +13,7 @@
 3. **开放词汇语义**：SAM 区域的 CLIP 特征经 PCA 压缩为监督图，再通过官方 Gaussian Rasterizer 蒸馏到每个训练完成的高斯点。
 4. **少图模式**：可均匀限制训练视角，并复用官方主分支的单目深度正则化；对视频帧支持 sequential COLMAP matcher。
 5. **搜索和编辑**：文本查询返回全部匹配高斯、数量、中心和包围盒；可导出命中点云，或生成删除/仅保留目标的新模型。
-6. **交互检查**：浏览器 UI 可输入文本、查看所有命中点并点击已注册视图中的物体；官方 SIBR Viewer 继续负责自由三维导航。
+6. **网页交互**：[Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 可直接导入训练结果，在浏览器中拖动旋转、滚轮缩放、点击拾取、文本定位并可恢复地隐藏语义物体。
 
 ## 目录
 
@@ -26,6 +26,7 @@ semantic_edit.py              删除/仅保留查询结果，源模型不改
 gaussian_transform.py         移动/旋转/缩放全部或语义选中高斯
 semantic_inspect.py           指定视图与像素，返回点和语义信息
 semantic_viewer.py            文本搜索 + 鼠标点击 Web UI
+export_web_bundle.py          导出 Gaussian Atlas 的 PLY + 语义索引
 scripts/prepare_dataset.py    自建图片目录导入
 scripts/run_pipeline.py       完整流水线与 dry-run
 scripts/preflight.py          环境/数据/检查点诊断
@@ -80,7 +81,7 @@ python scripts/run_pipeline.py \
 
 ## 4. GPU 冒烟测试
 
-没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **T4 GPU**。它会使用 NeRF Synthetic Lego 的 8 个稀疏视角，实际跑通 CUDA rasterizer、SAM+CLIP、RGB 训练、语义蒸馏、文本查询和非破坏性删除；默认不使用昂贵的 A100/H100。Notebook 内置一份助手预生成的重要物体 JSON，用来替代测试阶段的 LLM API 调用。最后一个展示区会训练一个 3,000 次迭代的展示模型，并提供水平旋转、俯仰和缩放控件；每次操作都从新的相机位姿实时调用 Gaussian rasterizer，展示的是渲染模型，不是点云或视频。
+没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **T4 GPU**。它会使用 NeRF Synthetic Lego 的 8 个稀疏视角，实际跑通 CUDA rasterizer、SAM+CLIP、RGB 训练、语义蒸馏、文本查询和非破坏性删除；默认不使用昂贵的 A100/H100。Notebook 内置一份助手预生成的重要物体 JSON，用来替代测试阶段的 LLM API 调用。最后会训练一个 3,000 次迭代的展示模型并生成 `gaussian_atlas_web_bundle.zip`；解压后把 `point_cloud.ply` 与 `semantic_objects.json` 依次导入 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 即可交互查看。
 
 冒烟测试只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
 
@@ -182,7 +183,19 @@ python semantic_inspect.py \
   --labels "apple,cup,table"
 ```
 
-启动可点击 Web UI：
+导出独立网页所需的模型与语义索引：
+
+```bash
+python export_web_bundle.py \
+  --model output/my_scene \
+  --labels "apple,cup,table" \
+  --threshold 0.25 \
+  --output_dir output/my_scene_web
+```
+
+打开 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site)，先导入 `output/my_scene_web/point_cloud.ply`，再导入 `semantic_objects.json`。模型只在浏览器本地读取，不会上传；网页中的隐藏操作也不覆盖源文件。
+
+旧的已注册视图 UI 仍可本地启动：
 
 ```bash
 python semantic_viewer.py \
@@ -206,6 +219,7 @@ python -m unittest discover -s tests -v
 python -m compileall -q arguments gaussian_renderer scene semantic scripts \
   train.py train_semantics.py preprocess_semantics.py \
   semantic_query.py semantic_edit.py semantic_inspect.py semantic_viewer.py \
+  export_web_bundle.py \
   gaussian_transform.py
 ```
 
