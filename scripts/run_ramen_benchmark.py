@@ -101,7 +101,7 @@ def main():
     for name, model in (("sequential", baseline), ("joint", joint)):
         output = output_root / f"eval_{name}"
         run([
-            sys.executable, repo / "scripts" / "evaluate_lerf_mask.py",
+            sys.executable, "-m", "scripts.evaluate_lerf_mask",
             "--model", model, "--test_mask", scene / "test_mask",
             "--iteration", args.iterations, "--threshold", 0.25,
             "--granularity", 1, "--output", output,
