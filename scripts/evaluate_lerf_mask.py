@@ -53,6 +53,15 @@ def camera_for_split(cameras, split_name):
     return ordered[index]
 
 
+def masked_psnr(rendered, target, mask):
+    mask = mask.to(device=rendered.device, dtype=torch.bool)
+    if not mask.any():
+        return None
+    error = (rendered - target).square().mean(dim=0)
+    mse = error[mask].mean().clamp_min(1e-12)
+    return float((-10.0 * torch.log10(mse)).item())
+
+
 def main():
     parser = ArgumentParser(description="Evaluate a Gaussian model on LERF-Mask")
     parser.add_argument("--model", required=True)
@@ -61,6 +70,8 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.25)
     parser.add_argument("--granularity", type=int, choices=[0, 1, 2], default=1)
     parser.add_argument("--boundary_ratio", type=float, default=0.008)
+    parser.add_argument("--important_labels", default="")
+    parser.add_argument("--normal_labels", default="")
     parser.add_argument("--output", default="")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -119,22 +130,47 @@ def main():
 
     output_dir = Path(args.output).resolve() if args.output else model_path / "lerf_mask_eval"
     output_dir.mkdir(parents=True, exist_ok=True)
+    important_labels = {
+        value.strip() for value in args.important_labels.split(",") if value.strip()
+    }
+    normal_labels = {
+        value.strip() for value in args.normal_labels.split(",") if value.strip()
+    }
     background = torch.zeros(3, dtype=torch.float32, device="cuda")
     rows = []
     reconstruction_rows = []
     for split in sorted(path for path in test_mask_root.iterdir() if path.is_dir()):
         camera = camera_for_split(cameras, split.name)
+        target_masks = {}
+        for target_path in sorted(split.glob("*.png")):
+            image = Image.open(target_path).convert("L").resize(
+                (camera.image_width, camera.image_height), Image.Resampling.NEAREST
+            )
+            target_masks[target_path.stem] = np.asarray(image) > 0
         with torch.no_grad():
             rgb_render = render(
                 camera, gaussians, pipeline, background
             )["render"].clamp(0, 1)
             ground_truth = camera.original_image[:3].cuda().clamp(0, 1)
-            reconstruction_rows.append({
+            reconstruction_row = {
                 "split": split.name,
                 "camera": camera.image_name,
                 "psnr": float(psnr(rgb_render, ground_truth).mean().item()),
                 "ssim": float(ssim(rgb_render, ground_truth).item()),
-            })
+            }
+            for tier_name, tier_labels in (
+                ("important", important_labels), ("normal", normal_labels)
+            ):
+                selected = [
+                    target_masks[label] for label in tier_labels
+                    if label in target_masks
+                ]
+                if selected:
+                    union = torch.from_numpy(np.logical_or.reduce(selected)).cuda()
+                    reconstruction_row[f"{tier_name}_psnr"] = masked_psnr(
+                        rgb_render, ground_truth, union
+                    )
+            reconstruction_rows.append(reconstruction_row)
             alpha = render(
                 camera, gaussians, pipeline, background,
                 override_color=torch.ones(
@@ -151,10 +187,7 @@ def main():
                 )["render"][0]
                 score_render = score_render / alpha.clamp_min(1e-4)
             prediction = (score_render >= args.threshold).cpu().numpy()
-            target_image = Image.open(target_path).convert("L").resize(
-                (camera.image_width, camera.image_height), Image.Resampling.NEAREST
-            )
-            target = np.asarray(target_image) > 0
+            target = target_masks[label]
             Image.fromarray(prediction.astype(np.uint8) * 255).save(
                 output_dir / f"{split.name}_{label}.png"
             )
@@ -185,6 +218,13 @@ def main():
         "reconstruction_rows": reconstruction_rows,
         "rows": rows,
     }
+    for tier_name in ("important", "normal"):
+        values = [
+            row[f"{tier_name}_psnr"] for row in reconstruction_rows
+            if row.get(f"{tier_name}_psnr") is not None
+        ]
+        if values:
+            result[f"test_{tier_name}_psnr"] = float(np.mean(values))
     if "importance_score" in artifact:
         importance = artifact["importance_score"].float().numpy()
         result["tier_gaussians"] = {

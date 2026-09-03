@@ -106,6 +106,7 @@ def main():
             "--model", model, "--test_mask", scene / "test_mask",
             "--iteration", args.iterations, "--threshold", 0.25,
             "--granularity", 1, "--output", output,
+            "--important_labels", IMPORTANT, "--normal_labels", NORMAL,
         ], repo)
         results[name] = json.loads((output / "metrics.json").read_text())
 
@@ -120,6 +121,7 @@ def main():
             key: results["sequential"][key]
             for key in (
                 "gaussians", "test_psnr", "test_ssim",
+                "test_important_psnr", "test_normal_psnr",
                 "mean_iou", "mean_boundary_iou",
             )
         },
@@ -127,6 +129,7 @@ def main():
             key: results["joint"][key]
             for key in (
                 "gaussians", "test_psnr", "test_ssim",
+                "test_important_psnr", "test_normal_psnr",
                 "mean_iou", "mean_boundary_iou", "tier_gaussians",
             )
             if key in results["joint"]
@@ -144,6 +147,14 @@ def main():
         "gaussians": summary["joint"]["gaussians"] - summary["sequential"]["gaussians"],
         "test_psnr": summary["joint"]["test_psnr"] - summary["sequential"]["test_psnr"],
         "test_ssim": summary["joint"]["test_ssim"] - summary["sequential"]["test_ssim"],
+        "test_important_psnr": (
+            summary["joint"]["test_important_psnr"]
+            - summary["sequential"]["test_important_psnr"]
+        ),
+        "test_normal_psnr": (
+            summary["joint"]["test_normal_psnr"]
+            - summary["sequential"]["test_normal_psnr"]
+        ),
         "mean_iou": summary["joint"]["mean_iou"] - summary["sequential"]["mean_iou"],
         "mean_boundary_iou": (
             summary["joint"]["mean_boundary_iou"]
