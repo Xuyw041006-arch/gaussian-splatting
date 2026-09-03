@@ -1,0 +1,151 @@
+"""Runtime for joint RGB reconstruction and hierarchical semantic distillation."""
+
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from gaussian_renderer import render
+from semantic.joint import (
+    ScaleGate,
+    granularity_for_step,
+    load_joint_map,
+    local_semantic_consistency,
+    project_tiers_to_gaussians,
+    select_granularity,
+    tier_weights,
+)
+
+
+class JointSemanticSupervisor:
+    def __init__(self, dataset, gaussians, pipeline, args):
+        self.dataset = dataset
+        self.gaussians = gaussians
+        self.pipeline = pipeline
+        self.args = args
+        self.semantic_dir = Path(
+            args.semantic_dir or os.path.join(dataset.source_path, "semantic_maps")
+        )
+        meta_path = Path(dataset.source_path) / "semantic_meta.npz"
+        if not self.semantic_dir.is_dir() or not meta_path.is_file():
+            raise FileNotFoundError(
+                "Joint training requires preprocess_semantics.py outputs"
+            )
+        with np.load(meta_path) as loaded:
+            self.meta = {key: loaded[key].copy() for key in loaded.files}
+        self.dimensions = int(self.meta["pca_components"].shape[0])
+        gaussians.setup_joint_semantics(self.dimensions, args.semantic_lr)
+        self.scale_gate = ScaleGate(self.dimensions).cuda()
+        self.gate_optimizer = torch.optim.Adam(
+            self.scale_gate.parameters(), lr=args.scale_gate_lr
+        )
+        self.background = torch.zeros(3, dtype=torch.float32, device="cuda")
+
+    def map_path(self, camera):
+        return self.semantic_dir / f"{Path(camera.image_name).stem}.npz"
+
+    def compute(self, camera, iteration):
+        path = self.map_path(camera)
+        if iteration < self.args.semantic_start or not path.is_file():
+            return None
+        supervision = load_joint_map(str(path))
+        level = granularity_for_step(iteration)
+        target, valid, confidence = select_granularity(supervision, level)
+        target = target.cuda(non_blocking=True)
+        valid = valid.cuda(non_blocking=True)
+        confidence = confidence.cuda(non_blocking=True)
+        tiers = supervision["importance"].cuda(non_blocking=True)
+
+        height, width = target.shape[-2:]
+        original_size = (camera.image_height, camera.image_width)
+        camera.image_height, camera.image_width = height, width
+        try:
+            features = self.gaussians.get_semantic_features * self.scale_gate(level)
+            chunks = (self.dimensions + 2) // 3
+            chunk = (iteration // 3) % chunks
+            start = 3 * chunk
+            stop = min(start + 3, self.dimensions)
+
+            with torch.no_grad():
+                alpha = render(
+                    camera, self.gaussians, self.pipeline, self.background,
+                    override_color=torch.ones(
+                        (features.shape[0], 3), dtype=features.dtype, device="cuda"
+                    ),
+                )["render"][:1].clamp(0, 1)
+            colors = torch.zeros((features.shape[0], 3), device="cuda")
+            colors[:, :stop - start] = features[:, start:stop]
+            semantic_package = render(
+                camera, self.gaussians, self.pipeline, self.background,
+                override_color=colors,
+            )
+            prediction = semantic_package["render"][:stop - start]
+            prediction = prediction / alpha.clamp_min(1e-4)
+            active = valid & (alpha[0] >= self.args.semantic_min_alpha)
+            if not active.any():
+                return None
+            error = torch.abs(prediction - target[start:stop]).mean(dim=0)
+            weights = confidence * tier_weights(tiers, self.args.semantic_tier_weights)
+            data_loss = (error[active] * weights[active]).sum() / weights[active].sum().clamp_min(1e-8)
+
+            spatial_loss = prediction.new_zeros(())
+            if iteration % self.args.semantic_spatial_every == 0:
+                spatial_loss = local_semantic_consistency(
+                    self.gaussians, self.args.semantic_spatial_samples
+                )
+            indices, observations = project_tiers_to_gaussians(
+                self.gaussians.get_xyz, camera, tiers,
+                semantic_package["visibility_filter"],
+            )
+            self.gaussians.update_importance_score(
+                indices, observations, self.args.importance_ema
+            )
+            loss = (
+                self.args.semantic_weight * data_loss
+                + self.args.semantic_spatial_weight
+                * self.args.semantic_spatial_every * spatial_loss
+            )
+            return {
+                "loss": loss,
+                "data_loss": data_loss.detach(),
+                "spatial_loss": spatial_loss.detach(),
+                "package": semantic_package,
+                "level": level,
+                "chunk": chunk,
+            }
+        finally:
+            camera.image_height, camera.image_width = original_size
+
+    def step(self):
+        self.gate_optimizer.step()
+        self.gate_optimizer.zero_grad(set_to_none=True)
+
+    def save(self, iteration):
+        output = (
+            Path(self.dataset.model_path) / "semantic" / f"iteration_{iteration}"
+            / "semantic_features.pt"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        artifact = {
+            "version": 2,
+            "training": "joint",
+            "scene_iteration": int(iteration),
+            "features": self.gaussians.get_semantic_features.detach().half().cpu(),
+            "importance_score": self.gaussians.importance_score.detach().half().cpu(),
+            "scale_gate": {
+                key: value.detach().cpu()
+                for key, value in self.scale_gate.state_dict().items()
+            },
+            "pca_components": torch.from_numpy(self.meta["pca_components"].astype(np.float32)),
+            "pca_mean": torch.from_numpy(self.meta["pca_mean"].astype(np.float32)),
+            "feature_min": torch.from_numpy(self.meta["feature_min"].astype(np.float32)),
+            "feature_max": torch.from_numpy(self.meta["feature_max"].astype(np.float32)),
+            "clip_model": str(self.meta["clip_model"].item()),
+            "clip_pretrained": str(self.meta["clip_pretrained"].item()),
+            "tier_rgb_weights": tuple(self.args.rgb_tier_weights),
+            "tier_semantic_weights": tuple(self.args.semantic_tier_weights),
+            "tier_sh_degrees": tuple(self.args.tier_sh_degrees),
+        }
+        torch.save(artifact, output)
+        return output

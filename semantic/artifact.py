@@ -32,3 +32,16 @@ def select_indices(scores, threshold, top_k=0):
         order = np.argsort(scores[indices])[-top_k:]
         indices = indices[order]
     return indices[np.argsort(scores[indices])[::-1]]
+
+
+def apply_scale_gate(encoded, artifact, level=1):
+    """Apply a saved SAGA-style scale gate; version-1 artifacts pass through."""
+    encoded = np.asarray(encoded, dtype=np.float32)
+    if "scale_gate" not in artifact:
+        return encoded
+    weight = artifact["scale_gate"]["linear.weight"].float().numpy()
+    bias = artifact["scale_gate"]["linear.bias"].float().numpy()
+    gate = 1.0 / (1.0 + np.exp(
+        -(weight[:, 0] * (float(level) / 2.0) + bias)
+    ))
+    return encoded * gate[None, :]

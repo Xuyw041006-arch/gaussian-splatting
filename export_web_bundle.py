@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from semantic.artifact import cosine_scores, decode_features, project_clip_feature
+from semantic.artifact import apply_scale_gate, cosine_scores, decode_features, project_clip_feature
 
 
 def read_label_specs(labels, labels_json):
@@ -81,6 +81,7 @@ def main():
     )
     parser.add_argument("--iteration", type=int, default=-1)
     parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--granularity", type=int, choices=[0, 1, 2], default=1)
     parser.add_argument("--top_k", type=int, default=30000, help="Maximum splats per label; 0 keeps all")
     parser.add_argument("--output_dir", default="")
     parser.add_argument("--device", default="cuda")
@@ -125,8 +126,11 @@ def main():
             p=2,
         ).cpu().numpy()
 
+    encoded = apply_scale_gate(
+        artifact["features"].float().numpy(), artifact, args.granularity
+    )
     decoded = decode_features(
-        artifact["features"].float().numpy(),
+        encoded,
         artifact["feature_min"].numpy(),
         artifact["feature_max"].numpy(),
     )
@@ -169,6 +173,7 @@ def main():
         "scene_iteration": iteration,
         "total_gaussians": vertex_count,
         "threshold": args.threshold,
+        "granularity": args.granularity,
         "objects": objects,
     }
     output_json = output_dir / "semantic_objects.json"

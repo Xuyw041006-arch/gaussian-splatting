@@ -22,7 +22,12 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.importance_utils import load_importance_mask, weighted_l1
+from utils.importance_utils import (
+    importance_to_tiers,
+    load_importance_mask,
+    weighted_l1,
+    weighted_tier_l1,
+)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -43,7 +48,7 @@ except:
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations,
              checkpoint, debug_from, importance_mask_dir="", foreground_weight=4.0,
-             background_weight=0.25):
+             background_weight=0.25, joint_args=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -56,6 +61,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    joint = None
+    if joint_args is not None and joint_args.joint_semantics:
+        if opt.optimizer_type == "sparse_adam":
+            raise ValueError("Joint semantic fields currently require the default Adam optimizer")
+        from semantic.joint_trainer import JointSemanticSupervisor
+        joint = JointSemanticSupervisor(dataset, gaussians, pipe, joint_args)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -127,6 +139,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
         if importance_mask is None:
             Ll1 = l1_loss(image, gt_image)
+        elif joint is not None:
+            Ll1 = weighted_tier_l1(
+                image, gt_image, importance_to_tiers(importance_mask),
+                joint_args.rgb_tier_weights,
+            )
         else:
             Ll1 = weighted_l1(
                 image, gt_image, importance_mask,
@@ -154,7 +171,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        joint_result = joint.compute(viewpoint_cam, iteration) if joint is not None else None
+        if joint_result is not None:
+            loss += joint_result["loss"]
+
         loss.backward()
+        if joint is not None:
+            gaussians.mask_sh_gradients(*joint_args.tier_sh_degrees)
 
         iter_end.record()
 
@@ -174,16 +197,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if joint is not None:
+                    semantic_path = joint.save(iteration)
+                    print(f"[ITER {iteration}] Saved joint semantics: {semantic_path}")
 
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                if joint_result is not None:
+                    semantic_package = joint_result["package"]
+                    gaussians.add_densification_stats(
+                        semantic_package["viewspace_points"],
+                        semantic_package["visibility_filter"],
+                    )
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold, 0.005, scene.cameras_extent,
+                        size_threshold, radii,
+                        joint_args.tier_densify_multipliers if joint is not None else None,
+                        joint_args.tier_opacity_multipliers if joint is not None else None,
+                    )
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -199,6 +236,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+                if joint is not None:
+                    joint.step()
+                    gaussians.enforce_sh_capacity(*joint_args.tier_sh_degrees)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -288,6 +328,39 @@ if __name__ == "__main__":
     )
     parser.add_argument("--foreground_weight", type=float, default=4.0)
     parser.add_argument("--background_weight", type=float, default=0.25)
+    parser.add_argument("--joint_semantics", action="store_true")
+    parser.add_argument("--semantic_dir", default="")
+    parser.add_argument("--semantic_start", type=int, default=1000)
+    parser.add_argument("--semantic_weight", type=float, default=0.15)
+    parser.add_argument("--semantic_lr", type=float, default=0.005)
+    parser.add_argument("--scale_gate_lr", type=float, default=0.001)
+    parser.add_argument("--semantic_min_alpha", type=float, default=0.05)
+    parser.add_argument("--semantic_spatial_weight", type=float, default=0.02)
+    parser.add_argument("--semantic_spatial_every", type=int, default=8)
+    parser.add_argument("--semantic_spatial_samples", type=int, default=512)
+    parser.add_argument("--importance_ema", type=float, default=0.90)
+    parser.add_argument(
+        "--rgb_tier_weights", nargs=3, type=float, default=(0.35, 1.0, 4.0),
+        metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
+    )
+    parser.add_argument(
+        "--semantic_tier_weights", nargs=3, type=float, default=(0.15, 1.0, 4.0),
+        metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
+    )
+    parser.add_argument(
+        "--tier_densify_multipliers", nargs=3, type=float,
+        default=(1.80, 1.0, 0.55),
+        metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
+    )
+    parser.add_argument(
+        "--tier_opacity_multipliers", nargs=3, type=float,
+        default=(2.0, 1.0, 0.5),
+        metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
+    )
+    parser.add_argument(
+        "--tier_sh_degrees", nargs=3, type=int, default=(1, 3, 5),
+        metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
+    )
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -306,11 +379,26 @@ if __name__ == "__main__":
             parser.error(f"Importance mask directory does not exist: {args.importance_mask_dir}")
     if args.foreground_weight <= 0 or args.background_weight <= 0:
         parser.error("Importance weights must be positive")
+    if args.joint_semantics:
+        positive = (
+            list(args.rgb_tier_weights) + list(args.semantic_tier_weights)
+            + list(args.tier_densify_multipliers)
+            + list(args.tier_opacity_multipliers)
+            + [args.semantic_weight, args.semantic_lr, args.scale_gate_lr]
+        )
+        if min(positive) <= 0:
+            parser.error("Joint semantic weights and learning rates must be positive")
+        if args.semantic_start < 0 or args.semantic_spatial_every < 1:
+            parser.error("Semantic start/every values are invalid")
+        if not 0 <= args.importance_ema < 1 or not 0 <= args.semantic_min_alpha < 1:
+            parser.error("EMA and minimum alpha must be in [0, 1)")
+        if max(args.tier_sh_degrees) > args.sh_degree:
+            parser.error("--sh_degree must cover every --tier_sh_degrees value")
     training(
         lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations,
         args.save_iterations, args.checkpoint_iterations, args.start_checkpoint,
         args.debug_from, args.importance_mask_dir, args.foreground_weight,
-        args.background_weight
+        args.background_weight, args
     )
 
     # All done

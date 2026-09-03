@@ -37,7 +37,22 @@ def load_importance_mask(mask_dir, image_name, size, device, cache):
     return mask
 
 
+def importance_to_tiers(mask):
+    """Convert legacy binary or new 0/127/255 maps into integer tiers 0/1/2."""
+    if mask is None:
+        return None
+    return torch.where(mask >= 0.75, 2, torch.where(mask >= 0.25, 1, 0)).long()
+
+
 def weighted_l1(rendered, target, mask, foreground_weight, background_weight):
     pixel_error = torch.abs(rendered - target).mean(dim=0, keepdim=True)
     weights = background_weight + mask * (foreground_weight - background_weight)
+    return (pixel_error * weights).sum() / weights.sum().clamp_min(1e-8)
+
+
+def weighted_tier_l1(rendered, target, tiers, tier_weights=(0.35, 1.0, 4.0)):
+    """RGB loss with explicit background, normal-object and important-object tiers."""
+    pixel_error = torch.abs(rendered - target).mean(dim=0, keepdim=True)
+    values = torch.as_tensor(tier_weights, dtype=rendered.dtype, device=rendered.device)
+    weights = values[tiers.long().clamp(0, 2)]
     return (pixel_error * weights).sum() / weights.sum().clamp_min(1e-8)

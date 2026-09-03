@@ -9,7 +9,9 @@ import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
 
-from semantic.artifact import cosine_scores, decode_features, project_clip_feature, select_indices
+from semantic.artifact import (
+    apply_scale_gate, cosine_scores, decode_features, project_clip_feature, select_indices,
+)
 
 
 def latest_iteration(model_path):
@@ -39,6 +41,7 @@ def main():
     parser.add_argument("--text", required=True)
     parser.add_argument("--iteration", type=int, default=-1)
     parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--granularity", type=int, choices=[0, 1, 2], default=1)
     parser.add_argument("--top_k", type=int, default=0, help="0 keeps every match")
     parser.add_argument("--output", default="selection.npz")
     parser.add_argument("--json", default="")
@@ -72,7 +75,9 @@ def main():
             clip_model.encode_text(tokenizer([args.text]).to(device)).float(), dim=-1, p=2
         )[0].cpu().numpy()
 
-    encoded = artifact["features"].float().numpy()
+    encoded = apply_scale_gate(
+        artifact["features"].float().numpy(), artifact, args.granularity
+    )
     decoded = decode_features(
         encoded, artifact["feature_min"].numpy(), artifact["feature_max"].numpy()
     )

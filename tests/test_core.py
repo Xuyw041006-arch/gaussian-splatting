@@ -1,9 +1,12 @@
 import unittest
 
 import numpy as np
+import torch
 
 from export_web_bundle import assign_disjoint_indices, read_label_specs
-from semantic.artifact import cosine_scores, decode_features, project_clip_feature, select_indices
+from semantic.artifact import (
+    apply_scale_gate, cosine_scores, decode_features, project_clip_feature, select_indices,
+)
 from semantic.inspection import pick_point, project_points
 from utils.view_selection import select_uniform
 
@@ -20,6 +23,17 @@ class ArtifactTests(unittest.TestCase):
         scores = cosine_scores([[1, 0], [0, 1], [0.8, 0.2]], projected)
         indices = select_indices(scores, threshold=0.7)
         self.assertEqual(indices.tolist(), [0, 2])
+
+    def test_saved_scale_gate_changes_granularity(self):
+        artifact = {"scale_gate": {
+            "linear.weight": torch.tensor([[2.0], [-2.0]]),
+            "linear.bias": torch.tensor([0.0, 0.0]),
+        }}
+        encoded = np.ones((1, 2), dtype=np.float32)
+        coarse = apply_scale_gate(encoded, artifact, 0)
+        fine = apply_scale_gate(encoded, artifact, 2)
+        self.assertGreater(fine[0, 0], coarse[0, 0])
+        self.assertLess(fine[0, 1], coarse[0, 1])
 
 
 class SparseViewTests(unittest.TestCase):

@@ -1,16 +1,17 @@
 # Semantic-Adaptive 3D Gaussian Splatting
 
 [![Open L4/T4 high-quality training in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_t4_full_smoke_test.ipynb)
+[![Open Ramen joint benchmark in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_ramen_joint_benchmark.ipynb)
 
-这是基于 Graphdeco 官方 `gaussian-splatting` 主分支的可运行扩展，不是 LaGa，也不是模拟点云。RGB 训练、CUDA 光栅化、COLMAP 数据读取、深度正则化和 SIBR Viewer 都来自原始 3DGS；本仓库新增开放词汇语义、重要区域加权、稀疏视角配置、文本搜索、非破坏性删除和点击检查。
+这是基于 Graphdeco 官方 `gaussian-splatting` 主分支的可运行扩展。RGB 训练、CUDA 光栅化、COLMAP 数据读取、深度正则化和 SIBR Viewer 都来自原始 3DGS；本仓库新增训练时联合语义优化、三级重要性资源分配、开放词汇搜索、非破坏性删除和点击检查。跨视图原型与多粒度门控分别受 LaGa、SAGA 启发，但不是两篇论文代码的逐行复现。
 
 > 使用范围继承上游 [LICENSE.md](LICENSE.md)：仅限非商业研究与评估。
 
 ## 已实现的闭环
 
 1. **自建数据**：普通照片复制到标准目录，COLMAP 自动计算相机与稀疏点云。
-2. **重要物体优先**：用户或 LLM 给出 `apple,cup` 等重要词；SAM+CLIP 生成每张图的前景权重图，RGB 训练提高前景损失、降低背景损失。
-3. **开放词汇语义**：SAM 区域按 predicted-IoU × stability 加权，ViT-H/14 CLIP 特征经 PCA 压缩后蒸馏到高斯；alpha 归一化避免透明度污染语义，颜色感知 KNN 约束跨视角实例一致性。
+2. **重要物体优先**：用户或 LLM 给出 `apple,cup` 等重要词；SAM+CLIP 生成重要、普通、背景三级监督，联合训练提高重点区域的 RGB/语义损失和高斯密度。
+3. **开放词汇语义**：SAM 区域按 predicted-IoU × stability 加权，ViT-H/14 CLIP 特征经 PCA 压缩后与 RGB 同时反向传播；alpha 归一化、场景原型和动态 3D 邻域损失共同抑制跨视图漂移。
 4. **少图模式**：可均匀限制训练视角，并复用官方主分支的单目深度正则化；对视频帧支持 sequential COLMAP matcher。
 5. **搜索和编辑**：文本查询返回全部匹配高斯、数量、中心和包围盒；可导出命中点云，或生成删除/仅保留目标的新模型。
 6. **网页交互**：[Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 可直接导入训练结果，在浏览器中拖动旋转、滚轮缩放、点击拾取、文本定位并可恢复地隐藏语义物体。
@@ -18,8 +19,8 @@
 ## 目录
 
 ```text
-preprocess_semantics.py       SAM + CLIP + PCA + 重要区域掩码
-train.py                      官方 RGB 训练（新增 importance loss）
+preprocess_semantics.py       SAM + CLIP + PCA + 三级层级监督
+train.py                      官方 3DGS + 联合语义/重要性训练
 train_semantics.py            语义特征蒸馏到固定 3D Gaussians
 semantic_query.py             “找到所有苹果”
 semantic_edit.py              删除/仅保留查询结果，源模型不改
@@ -30,6 +31,8 @@ export_web_bundle.py          导出 Gaussian Atlas 的 PLY + 语义索引
 scripts/prepare_dataset.py    自建图片目录导入
 scripts/prune_gaussians.py    尺度/透明度/空间离群高斯清理
 scripts/run_pipeline.py       完整流水线与 dry-run
+scripts/run_ramen_benchmark.py Ramen 顺序基线/联合模型 A/B 测试
+scripts/evaluate_lerf_mask.py  PSNR/SSIM/mIoU/Boundary-IoU
 scripts/preflight.py          环境/数据/检查点诊断
 semantic/                     查询、投影和拾取的公共逻辑
 tests/                        无 GPU 单元与命令规划测试
@@ -231,11 +234,58 @@ python -m unittest discover -s tests -v
 python -m compileall -q arguments gaussian_renderer scene semantic scripts \
   train.py train_semantics.py preprocess_semantics.py \
   semantic_query.py semantic_edit.py semantic_inspect.py semantic_viewer.py \
-  export_web_bundle.py \
+  export_web_bundle.py scripts/evaluate_lerf_mask.py \
+  scripts/run_ramen_benchmark.py \
   gaussian_transform.py
 ```
 
 无 GPU 测试不能证明 CUDA 扩展或训练可用；必须再执行上面的 GPU 冒烟测试。
+
+## 7. 联合重建与三级语义（LaGa + SAGA inspired）
+
+默认流水线现已改为联合训练：RGB、层级语义和重要性在同一个 `train.py`
+反向传播中优化。语义梯度与 RGB 梯度共同进入原版 3DGS 的
+`clone/split/prune`，不再等到重建结束后才附加语义。
+
+| 档位 | RGB 权重 | 语义权重 | 分裂阈值倍率 | opacity 剪枝倍率 | 有效 SH 阶数 |
+|---|---:|---:|---:|---:|---:|
+| 背景 | 0.35 | 0.15 | 1.80 | 2.00 | 1 |
+| 普通物品 | 1.00 | 1.00 | 1.00 | 1.00 | 3 |
+| 重要物品 | 4.00 | 4.00 | 0.55 | 0.50 | 5 |
+
+- **LaGa-inspired 跨视图一致性**：将全场景 SAM 区域的 CLIP 描述符聚成
+  64 个原型，再按区域置信度、簇内紧致度和描述符相似度以 0.65 权重聚合。
+- **SAGA-inspired 多粒度**：SAM 区域按画面面积分为 coarse（≥25%）、
+  middle（5%–25%）和 fine（<5%），训练时轮换监督并学习尺度通道门控。
+- **动态资源分配**：重要高斯更容易分裂、更难被删除，并允许五阶 SH；背景
+  高斯更难分裂、会更早剪枝，只训练一阶 SH。当前光栅器仍以全局最大 SH 阶数
+  执行，因此实际算力节省主要来自高斯数量分配。
+
+用户或 LLM 通过 `--important` / `--important_json` 提供重要物品，通过
+`--normal` / `--normal_json` 提供普通物品，未匹配区域作为背景。
+
+```bash
+python scripts/run_pipeline.py \
+  --scene data/my_scene --model output/my_scene \
+  --sam_checkpoint checkpoints/sam_vit_h_4b8939.pth \
+  --important "egg,pork belly,wavy noodles in bowl" \
+  --normal "yellow bowl,chopsticks,glass of water"
+```
+
+使用 `--training_mode sequential` 可保留旧的“先 RGB、后语义”基线。
+
+### LERF-Mask ramen 对比
+
+下面的脚本使用官方 `test_*.jpg` 与 `test_mask/0..2` 切分，对仓库原有
+“先重建、后语义”的顺序基线和新联合模型计算 PSNR、SSIM、mIoU 与
+Boundary-IoU：
+
+```bash
+python scripts/run_ramen_benchmark.py \
+  --scene data/lerf_mask/ramen \
+  --sam_checkpoint checkpoints/sam_vit_h_4b8939.pth \
+  --output_root output/ramen_ablation
+```
 
 ## 当前边界
 

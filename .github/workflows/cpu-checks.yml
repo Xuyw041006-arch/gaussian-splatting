@@ -17,4 +17,6 @@ jobs:
       - run: >-
           python -m compileall -q arguments gaussian_renderer scene semantic scripts
           train.py train_semantics.py preprocess_semantics.py semantic_query.py
-          semantic_edit.py semantic_inspect.py semantic_viewer.py gaussian_transform.py
+          semantic_edit.py semantic_inspect.py semantic_viewer.py export_web_bundle.py
+          scripts/evaluate_lerf_mask.py scripts/run_ramen_benchmark.py
+          gaussian_transform.py

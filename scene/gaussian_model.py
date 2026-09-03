@@ -57,6 +57,9 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._semantic_features = None
+        self.semantic_lr = 0.0
+        self.importance_score = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -66,6 +69,13 @@ class GaussianModel:
         self.setup_functions()
 
     def capture(self):
+        joint_state = None
+        if self.has_joint_semantics:
+            joint_state = {
+                "semantic_features": self._semantic_features,
+                "semantic_lr": self.semantic_lr,
+                "importance_score": self.importance_score,
+            }
         return (
             self.active_sh_degree,
             self._xyz,
@@ -79,9 +89,11 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            joint_state,
         )
     
     def restore(self, model_args, training_args):
+        joint_state = model_args[12] if len(model_args) > 12 else None
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -93,8 +105,15 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale) = model_args[:12]
         self.training_setup(training_args)
+        if joint_state is not None:
+            self.setup_joint_semantics(
+                joint_state["semantic_features"].shape[1],
+                joint_state.get("semantic_lr", 0.005),
+                features=joint_state["semantic_features"],
+                importance_score=joint_state.get("importance_score"),
+            )
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
@@ -128,6 +147,95 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def has_joint_semantics(self):
+        return self._semantic_features is not None
+
+    @property
+    def get_semantic_features(self):
+        if not self.has_joint_semantics:
+            raise RuntimeError("Joint semantic fields have not been initialized")
+        return torch.sigmoid(self._semantic_features)
+
+    def setup_joint_semantics(
+        self, dimensions, learning_rate=0.005, features=None, importance_score=None
+    ):
+        """Attach semantic features that follow RGB Gaussians through clone/split/prune."""
+        if self.optimizer is None:
+            raise RuntimeError("Call training_setup before setup_joint_semantics")
+        if self.has_joint_semantics:
+            if self._semantic_features.shape[1] != int(dimensions):
+                raise ValueError("Joint semantic dimension cannot change during training")
+            return
+        dimensions = int(dimensions)
+        if dimensions < 3:
+            raise ValueError("Joint semantic dimension must be at least 3")
+        if features is None:
+            features = torch.zeros(
+                (self.get_xyz.shape[0], dimensions), dtype=torch.float32, device="cuda"
+            )
+        else:
+            features = features.detach().to(device="cuda", dtype=torch.float32)
+        self._semantic_features = nn.Parameter(features.requires_grad_(True))
+        self.semantic_lr = float(learning_rate)
+        self.optimizer.add_param_group({
+            "params": [self._semantic_features],
+            "lr": self.semantic_lr,
+            "name": "semantic",
+        })
+        if importance_score is None:
+            importance_score = torch.full(
+                (self.get_xyz.shape[0],), 0.5, dtype=torch.float32, device="cuda"
+            )
+        self.importance_score = importance_score.detach().to(
+            device="cuda", dtype=torch.float32
+        ).clamp_(0, 1)
+
+    @torch.no_grad()
+    def update_importance_score(self, indices, observations, momentum=0.9):
+        """Fuse projected three-tier observations into a persistent per-Gaussian score."""
+        if not self.has_joint_semantics or len(indices) == 0:
+            return
+        indices = indices.reshape(-1)
+        observations = observations.reshape(-1).to(self.importance_score)
+        previous = self.importance_score[indices]
+        self.importance_score[indices] = (
+            float(momentum) * previous + (1.0 - float(momentum)) * observations
+        ).clamp_(0, 1)
+
+    def _sh_capacity_mask(self, background_degree=1, normal_degree=3, important_degree=5):
+        if self._features_rest.shape[1] == 0:
+            return None
+        degrees = torch.full_like(
+            self.importance_score, int(normal_degree), dtype=torch.long
+        )
+        degrees[self.importance_score < 0.25] = int(background_degree)
+        degrees[self.importance_score >= 0.75] = int(important_degree)
+        degrees.clamp_(0, self.max_sh_degree)
+        allowed = (degrees + 1).square() - 1
+        coefficient = torch.arange(
+            self._features_rest.shape[1], device=self._features_rest.device
+        )
+        return coefficient[None, :] < allowed[:, None]
+
+    def mask_sh_gradients(self, background_degree=1, normal_degree=3, important_degree=5):
+        """Give each importance tier a different effective SH capacity."""
+        if not self.has_joint_semantics or self._features_rest.grad is None:
+            return
+        mask = self._sh_capacity_mask(
+            background_degree, normal_degree, important_degree
+        )
+        self._features_rest.grad.mul_(mask[..., None])
+
+    @torch.no_grad()
+    def enforce_sh_capacity(self, background_degree=1, normal_degree=3, important_degree=5):
+        if not self.has_joint_semantics:
+            return
+        mask = self._sh_capacity_mask(
+            background_degree, normal_degree, important_degree
+        )
+        self._features_rest.mul_(mask[..., None])
     
     @property
     def get_exposure(self):
@@ -356,6 +464,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if "semantic" in optimizable_tensors:
+            self._semantic_features = optimizable_tensors["semantic"]
+            self.importance_score = self.importance_score[valid_points_mask]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -385,13 +496,21 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(
+        self, new_xyz, new_features_dc, new_features_rest, new_opacities,
+        new_scaling, new_rotation, new_tmp_radii,
+        new_semantics=None, new_importance=None,
+    ):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation}
+        if self.has_joint_semantics:
+            if new_semantics is None or new_importance is None:
+                raise ValueError("Joint densification must propagate semantics and importance")
+            d["semantic"] = new_semantics
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -400,6 +519,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if "semantic" in optimizable_tensors:
+            self._semantic_features = optimizable_tensors["semantic"]
+            self.importance_score = torch.cat((self.importance_score, new_importance))
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -426,8 +548,16 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        new_semantics = None
+        new_importance = None
+        if self.has_joint_semantics:
+            new_semantics = self._semantic_features[selected_pts_mask].repeat(N, 1)
+            new_importance = self.importance_score[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, new_opacity,
+            new_scaling, new_rotation, new_tmp_radii, new_semantics, new_importance,
+        )
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -446,18 +576,48 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_semantics = None
+        new_importance = None
+        if self.has_joint_semantics:
+            new_semantics = self._semantic_features[selected_pts_mask]
+            new_importance = self.importance_score[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, new_opacities,
+            new_scaling, new_rotation, new_tmp_radii, new_semantics, new_importance,
+        )
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(
+        self, max_grad, min_opacity, extent, max_screen_size, radii,
+        tier_grad_multipliers=None, tier_opacity_multipliers=None,
+    ):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        grad_threshold = max_grad
+        if self.has_joint_semantics and tier_grad_multipliers is not None:
+            background, normal, important = tier_grad_multipliers
+            grad_threshold = torch.full_like(self.importance_score, max_grad * normal)
+            grad_threshold[self.importance_score < 0.25] = max_grad * background
+            grad_threshold[self.importance_score >= 0.75] = max_grad * important
+        self.densify_and_clone(grads, grad_threshold, extent)
+        if self.has_joint_semantics and tier_grad_multipliers is not None:
+            background, normal, important = tier_grad_multipliers
+            grad_threshold = torch.full_like(self.importance_score, max_grad * normal)
+            grad_threshold[self.importance_score < 0.25] = max_grad * background
+            grad_threshold[self.importance_score >= 0.75] = max_grad * important
+        self.densify_and_split(grads, grad_threshold, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        opacity_threshold = min_opacity
+        if self.has_joint_semantics and tier_opacity_multipliers is not None:
+            background, normal, important = tier_opacity_multipliers
+            opacity_threshold = torch.full_like(
+                self.importance_score, min_opacity * normal
+            )
+            opacity_threshold[self.importance_score < 0.25] = min_opacity * background
+            opacity_threshold[self.importance_score >= 0.75] = min_opacity * important
+        prune_mask = self.get_opacity.squeeze() < opacity_threshold
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
