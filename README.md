@@ -1,6 +1,6 @@
 # Semantic-Adaptive 3D Gaussian Splatting
 
-[![Open T4 detailed training in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_t4_full_smoke_test.ipynb)
+[![Open L4/T4 high-quality training in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_t4_full_smoke_test.ipynb)
 
 这是基于 Graphdeco 官方 `gaussian-splatting` 主分支的可运行扩展，不是 LaGa，也不是模拟点云。RGB 训练、CUDA 光栅化、COLMAP 数据读取、深度正则化和 SIBR Viewer 都来自原始 3DGS；本仓库新增开放词汇语义、重要区域加权、稀疏视角配置、文本搜索、非破坏性删除和点击检查。
 
@@ -28,6 +28,7 @@ semantic_inspect.py           指定视图与像素，返回点和语义信息
 semantic_viewer.py            文本搜索 + 鼠标点击 Web UI
 export_web_bundle.py          导出 Gaussian Atlas 的 PLY + 语义索引
 scripts/prepare_dataset.py    自建图片目录导入
+scripts/prune_gaussians.py    尺度/透明度/空间离群高斯清理
 scripts/run_pipeline.py       完整流水线与 dry-run
 scripts/preflight.py          环境/数据/检查点诊断
 semantic/                     查询、投影和拾取的公共逻辑
@@ -79,9 +80,9 @@ python scripts/run_pipeline.py \
 
 `--dry_run` 只打印四个真实命令，不生成模型。
 
-## 4. T4 多视角精细训练与冒烟模式
+## 4. L4/T4 多视角高质量训练与冒烟模式
 
-没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **T4 GPU**。默认使用 NeRF Synthetic Lego 的 80 个训练视角、10 个验证视角、512 像素分辨率和 10 万初始化点，执行 30,000 次 RGB 与 3,000 次语义训练；预计用时约 45–90 分钟，不需要昂贵的 A100/H100。Notebook 内置一份助手预生成的重要物体 JSON，用来替代测试阶段的 LLM API 调用。最后生成 `gaussian_atlas_web_bundle.zip`；解压后把 `point_cloud.ply` 与 `semantic_objects.json` 依次导入 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 即可交互查看。
+没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **L4 GPU（推荐）** 或成本更低的 T4。默认使用 NeRF Synthetic Lego 的 80 个训练视角、10 个验证视角、512 像素分辨率和 10 万初始化点，执行 30,000 次 RGB 与 3,000 次语义训练；还会在语义蒸馏前自动备份原始 PLY，并清理巨大、低透明和空间离群高斯。Notebook 内置一份助手预生成的重要物体 JSON，用来替代测试阶段的 LLM API 调用。最后生成 `gaussian_atlas_web_bundle.zip`；解压后把 `point_cloud.ply` 与 `semantic_objects.json` 依次导入 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 即可交互查看。Lego 中的默认清理阈值是该演示场景的验证结果；自建数据应根据场景尺度重新调节。
 
 若只想先验证环境，可在命令行使用下面的小迭代冒烟模式；它只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
 
@@ -209,6 +210,17 @@ python semantic_viewer.py \
 ```bash
 ./SIBR_viewers/install/bin/SIBR_gaussianViewer_app -m output/my_scene
 ```
+
+若网页视图中出现少量巨大雾状高斯或远处散点，先写入新 PLY 进行可恢复清理：
+
+```bash
+python scripts/prune_gaussians.py \
+  --input output/my_scene/point_cloud/iteration_30000/point_cloud.ply \
+  --output output/my_scene/point_cloud/iteration_30000/point_cloud.clean.ply \
+  --max_scale 0.014 --min_opacity 0.50 --max_radius 1.20
+```
+
+`max_scale` 和 `max_radius` 与场景尺度相关，不应盲目复制到自建数据；请用保留视角的 PSNR/SSIM 和实际画面一起选择阈值。
 
 ## 6. 无 GPU 的代码测试
 
