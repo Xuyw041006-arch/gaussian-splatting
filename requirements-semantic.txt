@@ -1,5 +1,5 @@
-open-clip-torch==2.24.0
+open-clip-torch>=2.24,<4
 git+https://github.com/facebookresearch/segment-anything.git
-scikit-learn==1.2.2
+scikit-learn>=1.2,<2
 ftfy
 regex

@@ -1,5 +1,7 @@
 # Semantic-Adaptive 3D Gaussian Splatting
 
+[![Open T4 full smoke test in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_t4_full_smoke_test.ipynb)
+
 这是基于 Graphdeco 官方 `gaussian-splatting` 主分支的可运行扩展，不是 LaGa，也不是模拟点云。RGB 训练、CUDA 光栅化、COLMAP 数据读取、深度正则化和 SIBR Viewer 都来自原始 3DGS；本仓库新增开放词汇语义、重要区域加权、稀疏视角配置、文本搜索、非破坏性删除和点击检查。
 
 > 使用范围继承上游 [LICENSE.md](LICENSE.md)：仅限非商业研究与评估。
@@ -77,6 +79,8 @@ python scripts/run_pipeline.py \
 `--dry_run` 只打印四个真实命令，不生成模型。
 
 ## 4. GPU 冒烟测试
+
+没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **T4 GPU**。它会使用 NeRF Synthetic Lego 的 8 个稀疏视角，实际跑通 CUDA rasterizer、SAM+CLIP、RGB 训练、语义蒸馏、文本查询和非破坏性删除；默认不使用昂贵的 A100/H100。
 
 冒烟测试只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
 
