@@ -1,1 +1,2 @@
 gradio>=4.44,<6
+ipywidgets>=8,<9

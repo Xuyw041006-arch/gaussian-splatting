@@ -105,7 +105,7 @@ def tensor_to_image(rendering):
     pixels = (
         rendering.detach().clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy()
     )
-    return Image.fromarray(pixels, mode="RGB")
+    return Image.fromarray(pixels)
 
 
 def comparison_frame(original, edited=None):
