@@ -35,6 +35,10 @@ def build_steps(args):
         "--sam_checkpoint", str(Path(args.sam_checkpoint).resolve()),
         "--sam_model", args.sam_model, "--feature_dim", str(args.feature_dim),
         "--feature_width", str(args.feature_width),
+        "--clip_model", args.clip_model, "--clip_pretrained", args.clip_pretrained,
+        "--max_masks", str(args.max_masks),
+        "--points_per_side", str(args.points_per_side),
+        "--batch_size", str(args.clip_batch_size),
     ]
     if args.important:
         semantics.extend(["--important", args.important])
@@ -46,6 +50,11 @@ def build_steps(args):
         "--iterations", str(scene_iteration), "--save_iterations", str(scene_iteration),
         "--test_iterations", str(scene_iteration), "--disable_viewer",
         "--max_train_views", str(max_views), "--view_stride", str(args.view_stride),
+        "--densify_from_iter", str(args.densify_from_iter),
+        "--densify_until_iter", str(
+            min(args.densify_until_iter, max(1, int(scene_iteration * 0.75)))
+        ),
+        "--densify_grad_threshold", str(args.densify_grad_threshold),
     ]
     if args.important or args.important_json:
         rgb.extend([
@@ -57,10 +66,7 @@ def build_steps(args):
         rgb.extend(["-d", args.depths])
     if args.sparse:
         rgb.extend([
-            "--random_background", "--densify_from_iter", "100",
-            "--densify_grad_threshold", "0.0001",
-            "--densify_until_iter", str(min(15000, int(scene_iteration * 0.75))),
-            "--opacity_reset_interval", "1000",
+            "--random_background", "--opacity_reset_interval", "1000",
         ])
 
     semantic_train = [
@@ -68,6 +74,9 @@ def build_steps(args):
         "--iteration", str(scene_iteration),
         "--semantic_iterations", str(args.semantic_iterations),
         "--semantic_lr", str(args.semantic_lr),
+        "--spatial_weight", str(args.spatial_weight),
+        "--spatial_k", str(args.spatial_k),
+        "--spatial_samples", str(args.spatial_samples),
     ]
     return [
         Step("colmap", colmap, scene / "sparse" / "0" / "images.bin"),
@@ -91,13 +100,24 @@ def make_parser():
     parser.add_argument("--sam_model", choices=["vit_b", "vit_l", "vit_h"], default="vit_b")
     parser.add_argument("--important", default="")
     parser.add_argument("--important_json", default="")
-    parser.add_argument("--foreground_weight", type=float, default=4.0)
-    parser.add_argument("--background_weight", type=float, default=0.25)
-    parser.add_argument("--feature_dim", type=int, default=12)
-    parser.add_argument("--feature_width", type=int, default=320)
-    parser.add_argument("--scene_iterations", type=int, default=30000)
-    parser.add_argument("--semantic_iterations", type=int, default=5000)
-    parser.add_argument("--semantic_lr", type=float, default=0.01)
+    parser.add_argument("--foreground_weight", type=float, default=3.0)
+    parser.add_argument("--background_weight", type=float, default=0.75)
+    parser.add_argument("--clip_model", default="ViT-H-14")
+    parser.add_argument("--clip_pretrained", default="laion2b_s32b_b79k")
+    parser.add_argument("--feature_dim", type=int, default=24)
+    parser.add_argument("--feature_width", type=int, default=512)
+    parser.add_argument("--max_masks", type=int, default=192)
+    parser.add_argument("--points_per_side", type=int, default=32)
+    parser.add_argument("--clip_batch_size", type=int, default=16)
+    parser.add_argument("--scene_iterations", type=int, default=40000)
+    parser.add_argument("--semantic_iterations", type=int, default=8000)
+    parser.add_argument("--semantic_lr", type=float, default=0.005)
+    parser.add_argument("--spatial_weight", type=float, default=0.02)
+    parser.add_argument("--spatial_k", type=int, default=8)
+    parser.add_argument("--spatial_samples", type=int, default=4096)
+    parser.add_argument("--densify_from_iter", type=int, default=500)
+    parser.add_argument("--densify_until_iter", type=int, default=22000)
+    parser.add_argument("--densify_grad_threshold", type=float, default=0.0001)
     parser.add_argument("--sparse", action="store_true")
     parser.add_argument("--max_train_views", type=int, default=-1)
     parser.add_argument("--view_stride", type=int, default=1)
@@ -123,6 +143,17 @@ def main():
         parser.error(f"--stages must use only: {','.join(sorted(allowed))}")
     if args.view_stride < 1 or args.max_train_views == 0 or args.max_train_views == 1:
         parser.error("--view_stride must be >=1; --max_train_views must be -1 or >=2")
+    if min(
+        args.feature_dim, args.feature_width, args.max_masks, args.points_per_side,
+        args.clip_batch_size, args.scene_iterations, args.semantic_iterations,
+        args.spatial_k, args.spatial_samples, args.densify_from_iter,
+        args.densify_until_iter,
+    ) < 1:
+        parser.error("Training counts, dimensions, and sampling values must be positive")
+    if min(args.foreground_weight, args.background_weight, args.semantic_lr) <= 0:
+        parser.error("RGB weights and semantic learning rate must be positive")
+    if args.spatial_weight < 0 or args.densify_grad_threshold <= 0:
+        parser.error("Spatial weight must be non-negative and densify threshold positive")
 
     repo = Path(__file__).resolve().parents[1]
     for step in build_steps(args):

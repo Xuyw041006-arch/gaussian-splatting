@@ -10,7 +10,7 @@
 
 1. **自建数据**：普通照片复制到标准目录，COLMAP 自动计算相机与稀疏点云。
 2. **重要物体优先**：用户或 LLM 给出 `apple,cup` 等重要词；SAM+CLIP 生成每张图的前景权重图，RGB 训练提高前景损失、降低背景损失。
-3. **开放词汇语义**：SAM 区域的 CLIP 特征经 PCA 压缩为监督图，再通过官方 Gaussian Rasterizer 蒸馏到每个训练完成的高斯点。
+3. **开放词汇语义**：SAM 区域按 predicted-IoU × stability 加权，ViT-H/14 CLIP 特征经 PCA 压缩后蒸馏到高斯；alpha 归一化避免透明度污染语义，颜色感知 KNN 约束跨视角实例一致性。
 4. **少图模式**：可均匀限制训练视角，并复用官方主分支的单目深度正则化；对视频帧支持 sequential COLMAP matcher。
 5. **搜索和编辑**：文本查询返回全部匹配高斯、数量、中心和包围盒；可导出命中点云，或生成删除/仅保留目标的新模型。
 6. **网页交互**：[Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 可直接导入训练结果，在浏览器中拖动旋转、滚轮缩放、点击拾取、文本定位并可恢复地隐藏语义物体。
@@ -48,7 +48,7 @@ pip install -r requirements-semantic.txt
 pip install -r requirements-ui.txt
 ```
 
-下载与 `--sam_model` 一致的 Segment Anything 检查点。快速测试推荐体积较小的 `sam_vit_b_01ec64.pth`。
+下载与 `--sam_model` 一致的 Segment Anything 检查点。快速测试可用 `sam_vit_b_01ec64.pth`；高质量模式使用 `sam_vit_h_4b8939.pth`。
 
 ## 2. 自建数据
 
@@ -82,7 +82,7 @@ python scripts/run_pipeline.py \
 
 ## 4. L4/T4 多视角高质量训练与冒烟模式
 
-没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **L4 GPU（推荐）** 或成本更低的 T4。默认使用 NeRF Synthetic Lego 的 80 个训练视角、10 个验证视角、512 像素分辨率和 10 万初始化点，执行 30,000 次 RGB 与 3,000 次语义训练；还会在语义蒸馏前自动备份原始 PLY，并清理巨大、低透明和空间离群高斯。Notebook 内置一份助手预生成的重要物体 JSON，用来替代测试阶段的 LLM API 调用。最后生成 `gaussian_atlas_web_bundle.zip`；解压后把 `point_cloud.ply` 与 `semantic_objects.json` 依次导入 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 即可交互查看。Lego 中的默认清理阈值是该演示场景的验证结果；自建数据应根据场景尺度重新调节。
+没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **L4 GPU（推荐）** 或成本更低的 T4。默认使用 NeRF Synthetic Lego 的 80 个训练视角、10 个验证视角、512 像素分辨率和 10 万初始化点，执行 40,000 次 RGB 与 8,000 次语义训练。RGB 阶段保留上游 3DGS 的梯度累计、clone/split 和 opacity pruning，把分裂延长到 22,000 轮；语义阶段使用 SAM ViT-H、OpenCLIP ViT-H/14、24 维场景特征、alpha 归一化和颜色感知 3D KNN 正则。Notebook 会备份原始 PLY，高细节清理预设预计保留约 17 万高斯，而不是此前约 6.8 万的体积优先版本。最后生成可导入 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 的网页包。Lego 阈值只适用于该演示场景；自建数据应根据尺度重新调节。
 
 若只想先验证环境，可在命令行使用下面的小迭代冒烟模式；它只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
 
@@ -105,7 +105,7 @@ output/my_scene_smoke/point_cloud/iteration_100/point_cloud.ply
 output/my_scene_smoke/semantic/iteration_100/semantic_features.pt
 ```
 
-正式训练去掉两个小迭代参数，默认 RGB 30,000 次、语义 5,000 次：
+正式训练去掉两个小迭代参数，默认 RGB 40,000 次、语义 8,000 次：
 
 ```bash
 python scripts/run_pipeline.py \
@@ -215,12 +215,12 @@ python semantic_viewer.py \
 
 ```bash
 python scripts/prune_gaussians.py \
-  --input output/my_scene/point_cloud/iteration_30000/point_cloud.ply \
-  --output output/my_scene/point_cloud/iteration_30000/point_cloud.clean.ply \
-  --max_scale 0.014 --min_opacity 0.50 --max_radius 1.20
+  --input output/my_scene/point_cloud/iteration_40000/point_cloud.ply \
+  --output output/my_scene/point_cloud/iteration_40000/point_cloud.clean.ply \
+  --max_scale 0.014 --min_opacity 0.005 --max_radius 1.30
 ```
 
-`max_scale` 和 `max_radius` 与场景尺度相关，不应盲目复制到自建数据；请用保留视角的 PSNR/SSIM 和实际画面一起选择阈值。
+这里是“高细节”而非“最小文件”预设。`max_scale` 和 `max_radius` 与场景尺度相关，不应盲目复制到自建数据；请同时比较高斯数量、保留视角的 PSNR/SSIM/LPIPS 和实际画面。
 
 ## 6. 无 GPU 的代码测试
 

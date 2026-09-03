@@ -22,6 +22,9 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(any(value.endswith("train.py") for value in rgb))
         self.assertIn("--importance_mask_dir", rgb)
         self.assertIn("--random_background", rgb)
+        self.assertEqual(rgb[rgb.index("--densify_until_iter") + 1], "75")
+        self.assertIn("ViT-H-14", steps[1].command)
+        self.assertIn("--spatial_weight", semantic)
         self.assertTrue(any(value.endswith("train_semantics.py") for value in semantic))
 
 

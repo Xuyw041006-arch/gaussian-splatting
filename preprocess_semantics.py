@@ -59,6 +59,16 @@ def build_region_map(regions, size):
     return region_map
 
 
+def region_confidences(regions, power=0.5, floor=0.05):
+    """Combine SAM's mask-quality signals into stable supervision weights."""
+    values = []
+    for region in regions:
+        predicted_iou = float(np.clip(region.get("predicted_iou", 1.0), 0.0, 1.0))
+        stability = float(np.clip(region.get("stability_score", 1.0), 0.0, 1.0))
+        values.append(max(floor, (predicted_iou * stability) ** power))
+    return np.asarray(values, dtype=np.float32)
+
+
 def parse_prompts(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -76,6 +86,11 @@ def main():
     parser.add_argument("--max_masks", type=int, default=128)
     parser.add_argument("--points_per_side", type=int, default=24)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--sam_confidence_power", type=float, default=0.5,
+        help="Exponent applied to predicted-IoU × stability mask weights",
+    )
+    parser.add_argument("--sam_confidence_floor", type=float, default=0.05)
     parser.add_argument(
         "--important", default="",
         help="Comma-separated user/LLM-selected object names, for example apple,cup",
@@ -95,6 +110,8 @@ def main():
         parser.error("feature width, max masks, and batch size must be positive")
     if args.importance_topk < 0:
         parser.error("--importance_topk must be >= 0")
+    if args.sam_confidence_power <= 0 or not 0 <= args.sam_confidence_floor <= 1:
+        parser.error("SAM confidence power must be positive and floor must be in [0, 1]")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error("CUDA was requested but is unavailable")
     scene = Path(args.scene).resolve()
@@ -171,13 +188,21 @@ def main():
         features = encode_regions(
             clip_model, clip_preprocess, rgb, regions, device, args.batch_size
         )
+        confidences = region_confidences(
+            regions, args.sam_confidence_power, args.sam_confidence_floor
+        )
         scale = args.feature_width / rgb.shape[1]
         feature_size = (args.feature_width, max(1, round(rgb.shape[0] * scale)))
         region_map = build_region_map(regions, feature_size)
         raw_path = raw_dir / f"{path.stem}.npz"
-        np.savez_compressed(raw_path, region_map=region_map, features=features.astype(np.float16))
+        np.savez_compressed(
+            raw_path,
+            region_map=region_map,
+            features=features.astype(np.float16),
+            confidences=confidences.astype(np.float16),
+        )
         all_features.append(features)
-        records.append((path, raw_path, rgb.shape[:2], features))
+        records.append((path, raw_path, rgb.shape[:2], features, confidences))
 
         importance = np.zeros(region_map.shape, dtype=np.uint8)
         current_prompts = prompt_map.get(path.name, prompt_map.get(path.stem, prompts))
@@ -207,7 +232,8 @@ def main():
     feature_range = np.maximum(feature_max - feature_min, 1e-6)
 
     offset = 0
-    for path, raw_path, _, features in tqdm(records, desc="Dense semantic maps"):
+    confidence_values = []
+    for path, raw_path, _, features, confidences in tqdm(records, desc="Dense semantic maps"):
         with np.load(raw_path) as raw:
             region_map = raw["region_map"]
         count = len(features)
@@ -216,10 +242,14 @@ def main():
         valid = region_map >= 0
         dense = np.zeros((*region_map.shape, dimensions), dtype=np.float32)
         dense[valid] = encoded[region_map[valid]]
+        confidence = np.zeros(region_map.shape, dtype=np.float32)
+        confidence[valid] = confidences[region_map[valid]]
+        confidence_values.extend(confidences.tolist())
         np.savez_compressed(
             maps_dir / f"{path.stem}.npz",
             features=dense.transpose(2, 0, 1).astype(np.float16),
             valid=valid.astype(np.uint8),
+            confidence=confidence.astype(np.float16),
         )
 
     np.savez(
@@ -234,6 +264,9 @@ def main():
     summary = {
         "images": len(paths), "regions": int(stacked.shape[0]),
         "feature_dim": dimensions, "important_prompts": prompts,
+        "clip_model": args.clip_model, "clip_pretrained": args.clip_pretrained,
+        "sam_model": args.sam_model,
+        "mean_sam_confidence": float(np.mean(confidence_values)),
         "important_json": str(Path(args.important_json).resolve()) if args.important_json else None,
         "semantic_maps": str(maps_dir), "importance_masks": str(importance_dir),
     }
