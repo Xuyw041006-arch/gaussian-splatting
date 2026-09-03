@@ -1,6 +1,6 @@
 # Semantic-Adaptive 3D Gaussian Splatting
 
-[![Open T4 full smoke test in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_t4_full_smoke_test.ipynb)
+[![Open T4 detailed training in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_t4_full_smoke_test.ipynb)
 
 这是基于 Graphdeco 官方 `gaussian-splatting` 主分支的可运行扩展，不是 LaGa，也不是模拟点云。RGB 训练、CUDA 光栅化、COLMAP 数据读取、深度正则化和 SIBR Viewer 都来自原始 3DGS；本仓库新增开放词汇语义、重要区域加权、稀疏视角配置、文本搜索、非破坏性删除和点击检查。
 
@@ -79,11 +79,11 @@ python scripts/run_pipeline.py \
 
 `--dry_run` 只打印四个真实命令，不生成模型。
 
-## 4. GPU 冒烟测试
+## 4. T4 多视角精细训练与冒烟模式
 
-没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **T4 GPU**。它会使用 NeRF Synthetic Lego 的 8 个稀疏视角，实际跑通 CUDA rasterizer、SAM+CLIP、RGB 训练、语义蒸馏、文本查询和非破坏性删除；默认不使用昂贵的 A100/H100。Notebook 内置一份助手预生成的重要物体 JSON，用来替代测试阶段的 LLM API 调用。最后会训练一个 3,000 次迭代的展示模型并生成 `gaussian_atlas_web_bundle.zip`；解压后把 `point_cloud.ply` 与 `semantic_objects.json` 依次导入 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 即可交互查看。
+没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **T4 GPU**。默认使用 NeRF Synthetic Lego 的 80 个训练视角、10 个验证视角、512 像素分辨率和 10 万初始化点，执行 30,000 次 RGB 与 3,000 次语义训练；预计用时约 45–90 分钟，不需要昂贵的 A100/H100。Notebook 内置一份助手预生成的重要物体 JSON，用来替代测试阶段的 LLM API 调用。最后生成 `gaussian_atlas_web_bundle.zip`；解压后把 `point_cloud.ply` 与 `semantic_objects.json` 依次导入 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 即可交互查看。
 
-冒烟测试只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
+若只想先验证环境，可在命令行使用下面的小迭代冒烟模式；它只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
 
 ```bash
 python scripts/run_pipeline.py \
