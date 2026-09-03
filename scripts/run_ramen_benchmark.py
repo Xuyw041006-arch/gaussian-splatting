@@ -21,8 +21,9 @@ def main():
     parser.add_argument("--scene", required=True)
     parser.add_argument("--sam_checkpoint", required=True)
     parser.add_argument("--output_root", required=True)
-    parser.add_argument("--iterations", type=int, default=15000)
-    parser.add_argument("--semantic_iterations", type=int, default=2000)
+    parser.add_argument("--iterations", type=int, default=30000)
+    parser.add_argument("--semantic_iterations", type=int, default=5000)
+    parser.add_argument("--semantic_start", type=int, default=1000)
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--feature_width", type=int, default=512)
     parser.add_argument("--skip_preprocess", action="store_true")
@@ -33,6 +34,8 @@ def main():
 
     if min(args.iterations, args.semantic_iterations, args.feature_dim) < 1:
         parser.error("iteration and feature values must be positive")
+    if not 0 <= args.semantic_start < args.iterations:
+        parser.error("semantic start must be in [0, iterations)")
     repo = Path(__file__).resolve().parents[1]
     scene = Path(args.scene).resolve()
     output_root = Path(args.output_root).resolve()
@@ -59,10 +62,14 @@ def main():
             "--cross_view_prototypes", 64, "--cross_view_weight", 0.65,
         ], repo)
 
-    densify_until = min(10000, max(1000, int(args.iterations * 0.72)))
+    # Match the original 30k 3DGS schedule for the full experiment.  The pilot
+    # keeps a proportional warm-up while the full run densifies through 15k.
+    densify_until = min(15000, max(1000, int(args.iterations * 0.72)))
+    save_iterations = sorted({args.iterations, min(7000, args.iterations), min(15000, args.iterations)})
     common_train = [
         "-s", scene, "--eval", "--iterations", args.iterations,
-        "--save_iterations", args.iterations, "--test_iterations", args.iterations,
+        "--save_iterations", *save_iterations,
+        "--test_iterations", args.iterations,
         "--disable_viewer", "--densify_from_iter", 500,
         "--densify_until_iter", densify_until, "--densify_grad_threshold", 0.00015,
         "--importance_mask_dir", scene / "importance_masks",
@@ -84,7 +91,7 @@ def main():
             run([
                 sys.executable, repo / "train.py", "-m", joint, *common_train,
                 "--joint_semantics", "--semantic_dir", scene / "semantic_maps",
-                "--sh_degree", 5, "--semantic_start", 500,
+                "--sh_degree", 5, "--semantic_start", args.semantic_start,
                 "--semantic_weight", 0.20, "--semantic_lr", 0.01,
                 "--scale_gate_lr", 0.001,
                 "--rgb_tier_weights", 0.35, 1.0, 4.0,

@@ -303,7 +303,8 @@ semantic threshold 0.25）：
 已经工作；但短训练下全局画质和边界质量仍落后，不能宣称全面优于现有方法。
 原始指标见 [`benchmarks/ramen_pilot_1500.json`](benchmarks/ramen_pilot_1500.json)，
 完整公式、阈值、限制和下一轮优化见 [`docs/JOINT_MODEL.md`](docs/JOINT_MODEL.md)。
-论文级对比请在 Notebook 中选择 full 模式运行 15,000/2,000 轮。
+论文级对比请在 Notebook 中选择 full 模式运行 30,000/5,000 轮；联合语义
+从第 1,000 轮开启，并沿用原始 3DGS 到第 15,000 轮的 densification 日程。
 
 ## 当前边界
 
