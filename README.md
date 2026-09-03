@@ -80,7 +80,7 @@ python scripts/run_pipeline.py \
 
 ## 4. GPU 冒烟测试
 
-没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **T4 GPU**。它会使用 NeRF Synthetic Lego 的 8 个稀疏视角，实际跑通 CUDA rasterizer、SAM+CLIP、RGB 训练、语义蒸馏、文本查询和非破坏性删除；默认不使用昂贵的 A100/H100。
+没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **T4 GPU**。它会使用 NeRF Synthetic Lego 的 8 个稀疏视角，实际跑通 CUDA rasterizer、SAM+CLIP、RGB 训练、语义蒸馏、文本查询和非破坏性删除；默认不使用昂贵的 A100/H100。Notebook 内置一份助手预生成的重要物体 JSON，用来替代测试阶段的 LLM API 调用。
 
 冒烟测试只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
 
