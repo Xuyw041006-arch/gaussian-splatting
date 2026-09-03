@@ -10,6 +10,7 @@ from gaussian_renderer import render
 from semantic.joint import (
     ScaleGate,
     granularity_for_step,
+    load_importance_tiers,
     load_joint_map,
     local_semantic_consistency,
     project_tiers_to_gaussians,
@@ -26,6 +27,10 @@ class JointSemanticSupervisor:
         self.args = args
         self.semantic_dir = Path(
             args.semantic_dir or os.path.join(dataset.source_path, "semantic_maps")
+        )
+        self.importance_dir = Path(
+            args.importance_mask_dir
+            or os.path.join(dataset.source_path, "importance_masks")
         )
         meta_path = Path(dataset.source_path) / "semantic_meta.npz"
         if not self.semantic_dir.is_dir() or not meta_path.is_file():
@@ -45,13 +50,16 @@ class JointSemanticSupervisor:
     def map_path(self, camera):
         return self.semantic_dir / f"{Path(camera.image_name).stem}.npz"
 
+    def importance_path(self, camera):
+        return self.importance_dir / f"{Path(camera.image_name).stem}.png"
+
     @torch.no_grad()
     def observe_importance(self, camera, visible_indices):
         """Fuse tier evidence from every RGB iteration, including semantic warmup."""
-        path = self.map_path(camera)
+        path = self.importance_path(camera)
         if not path.is_file():
             return
-        tiers = load_joint_map(str(path))["importance"].cuda(non_blocking=True)
+        tiers = load_importance_tiers(str(path)).cuda(non_blocking=True)
         indices, observations = project_tiers_to_gaussians(
             self.gaussians.get_xyz, camera, tiers, visible_indices
         )
@@ -77,9 +85,6 @@ class JointSemanticSupervisor:
         try:
             features = self.gaussians.get_semantic_features * self.scale_gate(level)
             chunks = (self.dimensions + 2) // 3
-            chunk = (iteration // 3) % chunks
-            start = 3 * chunk
-            stop = min(start + 3, self.dimensions)
 
             with torch.no_grad():
                 alpha = render(
@@ -88,20 +93,32 @@ class JointSemanticSupervisor:
                         (features.shape[0], 3), dtype=features.dtype, device="cuda"
                     ),
                 )["render"][:1].clamp(0, 1)
-            colors = torch.zeros((features.shape[0], 3), device="cuda")
-            colors[:, :stop - start] = features[:, start:stop]
-            semantic_package = render(
-                camera, self.gaussians, self.pipeline, self.background,
-                override_color=colors,
-            )
-            prediction = semantic_package["render"][:stop - start]
-            prediction = prediction / alpha.clamp_min(1e-4)
             active = valid & (alpha[0] >= self.args.semantic_min_alpha)
             if not active.any():
                 return None
-            error = torch.abs(prediction - target[start:stop]).mean(dim=0)
             weights = confidence * tier_weights(tiers, self.args.semantic_tier_weights)
-            data_loss = (error[active] * weights[active]).sum() / weights[active].sum().clamp_min(1e-8)
+            chunk_losses = []
+            packages = []
+            first_chunk = (iteration * self.args.semantic_chunks_per_step) % chunks
+            for offset in range(min(self.args.semantic_chunks_per_step, chunks)):
+                chunk = (first_chunk + offset) % chunks
+                start = 3 * chunk
+                stop = min(start + 3, self.dimensions)
+                colors = torch.zeros((features.shape[0], 3), device="cuda")
+                colors[:, :stop - start] = features[:, start:stop]
+                semantic_package = render(
+                    camera, self.gaussians, self.pipeline, self.background,
+                    override_color=colors,
+                )
+                prediction = semantic_package["render"][:stop - start]
+                prediction = prediction / alpha.clamp_min(1e-4)
+                error = torch.abs(prediction - target[start:stop]).mean(dim=0)
+                chunk_losses.append(
+                    (error[active] * weights[active]).sum()
+                    / weights[active].sum().clamp_min(1e-8)
+                )
+                packages.append(semantic_package)
+            data_loss = torch.stack(chunk_losses).mean()
 
             spatial_loss = prediction.new_zeros(())
             if iteration % self.args.semantic_spatial_every == 0:
@@ -117,9 +134,12 @@ class JointSemanticSupervisor:
                 "loss": loss,
                 "data_loss": data_loss.detach(),
                 "spatial_loss": spatial_loss.detach(),
-                "package": semantic_package,
+                "packages": packages,
                 "level": level,
-                "chunk": chunk,
+                "chunks": [
+                    (first_chunk + offset) % chunks
+                    for offset in range(min(self.args.semantic_chunks_per_step, chunks))
+                ],
             }
         finally:
             camera.image_height, camera.image_width = original_size

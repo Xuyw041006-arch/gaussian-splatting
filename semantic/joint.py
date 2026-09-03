@@ -4,6 +4,7 @@ from functools import lru_cache
 
 import numpy as np
 import torch
+from PIL import Image
 from torch import nn
 
 
@@ -77,6 +78,16 @@ def load_joint_map(path):
         ),
         "importance": torch.from_numpy(importance),
     }
+
+
+@lru_cache(maxsize=256)
+def load_importance_tiers(path):
+    """Load the compact three-tier PNG without decompressing semantic tensors."""
+    values = np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
+    tiers = np.where(values >= 191, 2, np.where(values >= 63, 1, 0)).astype(
+        np.uint8
+    )
+    return torch.from_numpy(tiers)
 
 
 def select_granularity(supervision, level):

@@ -85,7 +85,7 @@ def main():
                 sys.executable, repo / "train.py", "-m", joint, *common_train,
                 "--joint_semantics", "--semantic_dir", scene / "semantic_maps",
                 "--sh_degree", 5, "--semantic_start", 500,
-                "--semantic_weight", 0.15, "--semantic_lr", 0.005,
+                "--semantic_weight", 0.20, "--semantic_lr", 0.01,
                 "--scale_gate_lr", 0.001,
                 "--rgb_tier_weights", 0.35, 1.0, 4.0,
                 "--semantic_tier_weights", 0.15, 1.0, 4.0,
@@ -95,6 +95,7 @@ def main():
                 "--semantic_spatial_weight", 0.02,
                 "--semantic_spatial_every", 8,
                 "--semantic_spatial_samples", 512,
+                "--semantic_chunks_per_step", 3,
             ], repo)
 
     results = {}

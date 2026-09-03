@@ -209,11 +209,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
                 if joint_result is not None:
-                    semantic_package = joint_result["package"]
-                    gaussians.add_densification_stats(
-                        semantic_package["viewspace_points"],
-                        semantic_package["visibility_filter"],
-                    )
+                    for semantic_package in joint_result["packages"]:
+                        gaussians.add_densification_stats(
+                            semantic_package["viewspace_points"],
+                            semantic_package["visibility_filter"],
+                        )
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -340,6 +340,7 @@ if __name__ == "__main__":
     parser.add_argument("--semantic_spatial_weight", type=float, default=0.02)
     parser.add_argument("--semantic_spatial_every", type=int, default=8)
     parser.add_argument("--semantic_spatial_samples", type=int, default=512)
+    parser.add_argument("--semantic_chunks_per_step", type=int, default=3)
     parser.add_argument("--importance_ema", type=float, default=0.90)
     parser.add_argument(
         "--rgb_tier_weights", nargs=3, type=float, default=(0.35, 1.0, 4.0),
@@ -390,7 +391,10 @@ if __name__ == "__main__":
         )
         if min(positive) <= 0:
             parser.error("Joint semantic weights and learning rates must be positive")
-        if args.semantic_start < 0 or args.semantic_spatial_every < 1:
+        if (
+            args.semantic_start < 0 or args.semantic_spatial_every < 1
+            or args.semantic_chunks_per_step < 1
+        ):
             parser.error("Semantic start/every values are invalid")
         if not 0 <= args.importance_ema < 1 or not 0 <= args.semantic_min_alpha < 1:
             parser.error("EMA and minimum alpha must be in [0, 1)")

@@ -80,6 +80,7 @@ def build_steps(args):
             "--semantic_spatial_weight", str(args.spatial_weight),
             "--semantic_spatial_every", str(args.spatial_every),
             "--semantic_spatial_samples", str(args.joint_spatial_samples),
+            "--semantic_chunks_per_step", str(args.semantic_chunks_per_step),
             "--importance_ema", str(args.importance_ema),
             "--rgb_tier_weights", *map(str, args.rgb_tier_weights),
             "--semantic_tier_weights", *map(str, args.semantic_tier_weights),
@@ -161,6 +162,7 @@ def make_parser():
     parser.add_argument("--scale_gate_lr", type=float, default=0.001)
     parser.add_argument("--spatial_every", type=int, default=8)
     parser.add_argument("--joint_spatial_samples", type=int, default=512)
+    parser.add_argument("--semantic_chunks_per_step", type=int, default=3)
     parser.add_argument("--importance_ema", type=float, default=0.90)
     parser.add_argument("--rgb_tier_weights", nargs=3, type=float, default=(0.35, 1.0, 4.0))
     parser.add_argument("--semantic_tier_weights", nargs=3, type=float, default=(0.15, 1.0, 4.0))
@@ -203,6 +205,7 @@ def main():
         args.spatial_k, args.spatial_samples, args.densify_from_iter,
         args.densify_until_iter, args.cross_view_prototypes,
         args.spatial_every, args.joint_spatial_samples,
+        args.semantic_chunks_per_step,
     ) < 1:
         parser.error("Training counts, dimensions, and sampling values must be positive")
     if min(args.foreground_weight, args.background_weight, args.semantic_lr) <= 0:
