@@ -305,6 +305,10 @@ semantic threshold 0.25）：
 完整公式、阈值、限制和下一轮优化见 [`docs/JOINT_MODEL.md`](docs/JOINT_MODEL.md)。
 论文级对比请在 Notebook 中选择 full 模式运行 30,000/5,000 轮；联合语义
 从第 1,000 轮开启，并沿用原始 3DGS 到第 15,000 轮的 densification 日程。
+Notebook 默认将公开数据、SAM 检查点、语义预处理和全部训练结果写入
+`MyDrive/semantic_adaptive_3dgs/ramen_full_30k/`。加上 `--resume` 后，RGB/联合
+训练从最近的 7k 或 15k 检查点继续，顺序语义训练每 1,000 轮保存 Adam 状态；
+浏览器或 Colab 运行时中断不再要求从零开始。
 
 ## 当前边界
 

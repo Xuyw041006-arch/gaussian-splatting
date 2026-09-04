@@ -148,6 +148,22 @@ class JointSemanticSupervisor:
         self.gate_optimizer.step()
         self.gate_optimizer.zero_grad(set_to_none=True)
 
+    def checkpoint_state(self):
+        """State not owned by GaussianModel and needed for exact continuation."""
+        return {
+            "scale_gate": self.scale_gate.state_dict(),
+            "gate_optimizer": self.gate_optimizer.state_dict(),
+        }
+
+    def restore_checkpoint_state(self, state):
+        if not state:
+            return
+        if "scale_gate" in state:
+            self.scale_gate.load_state_dict(state["scale_gate"])
+        if "gate_optimizer" in state:
+            self.gate_optimizer.load_state_dict(state["gate_optimizer"])
+        print("Restored joint semantic scale-gate checkpoint")
+
     def save(self, iteration):
         output = (
             Path(self.dataset.model_path) / "semantic" / f"iteration_{iteration}"

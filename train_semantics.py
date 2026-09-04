@@ -1,6 +1,7 @@
 """Distill 2D SAM+CLIP feature maps into the trained 3D Gaussians."""
 
 import os
+import json
 from argparse import ArgumentParser
 from functools import lru_cache
 from pathlib import Path
@@ -35,10 +36,11 @@ def load_map(path):
     return features, valid, confidence
 
 
-def save_artifact(path, logits, scene_iteration, meta):
+def save_artifact(path, logits, scene_iteration, semantic_step, meta):
     artifact = {
         "version": 1,
         "scene_iteration": int(scene_iteration),
+        "semantic_step": int(semantic_step),
         "features": torch.sigmoid(logits.detach()).half().cpu(),
         "pca_components": torch.from_numpy(meta["pca_components"].astype(np.float32)),
         "pca_mean": torch.from_numpy(meta["pca_mean"].astype(np.float32)),
@@ -51,6 +53,19 @@ def save_artifact(path, logits, scene_iteration, meta):
     torch.save(artifact, path)
 
 
+def save_training_checkpoint(path, logits, optimizer, step):
+    """Atomically save resumable semantic state, including Adam moments."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = f"{path}.tmp"
+    torch.save({
+        "version": 1,
+        "step": int(step),
+        "logits": logits.detach(),
+        "optimizer": optimizer.state_dict(),
+    }, temporary)
+    os.replace(temporary, path)
+
+
 def main():
     parser = ArgumentParser(description="Train open-vocabulary features on fixed 3D Gaussians")
     model_params = ModelParams(parser, sentinel=True)
@@ -60,6 +75,7 @@ def main():
     parser.add_argument("--semantic_iterations", type=int, default=5000)
     parser.add_argument("--semantic_lr", type=float, default=0.01)
     parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--spatial_weight", type=float, default=0.02)
     parser.add_argument("--spatial_k", type=int, default=8)
     parser.add_argument("--spatial_samples", type=int, default=4096)
@@ -93,10 +109,26 @@ def main():
     with np.load(meta_path) as loaded_meta:
         meta = {key: loaded_meta[key].copy() for key in loaded_meta.files}
     dimensions = int(meta["pca_components"].shape[0])
+    output_dir = os.path.join(
+        dataset.model_path, "semantic", f"iteration_{scene.loaded_iter}"
+    )
+    output_path = os.path.join(output_dir, "semantic_features.pt")
+    checkpoint_path = os.path.join(output_dir, "semantic_checkpoint.pt")
+    completion_path = os.path.join(output_dir, "training_complete.json")
     logits = torch.nn.Parameter(
         torch.zeros((gaussians.get_xyz.shape[0], dimensions), device="cuda")
     )
     optimizer = torch.optim.Adam([logits], lr=args.semantic_lr)
+    first_step = 0
+    if args.resume and os.path.isfile(checkpoint_path):
+        state = torch.load(checkpoint_path, map_location="cuda")
+        if tuple(state["logits"].shape) != tuple(logits.shape):
+            raise RuntimeError("Semantic checkpoint shape does not match Gaussian model")
+        with torch.no_grad():
+            logits.copy_(state["logits"])
+        optimizer.load_state_dict(state["optimizer"])
+        first_step = int(state["step"])
+        print(f"Resuming semantic training from step {first_step}")
 
     neighbor_indices = neighbor_weights = None
     if args.spatial_weight > 0:
@@ -117,11 +149,11 @@ def main():
 
     pipeline = pipeline_params.extract(args)
     background = torch.zeros(3, device="cuda")
-    output_path = os.path.join(
-        dataset.model_path, "semantic", f"iteration_{scene.loaded_iter}",
-        "semantic_features.pt",
+    progress = tqdm(
+        range(first_step + 1, args.semantic_iterations + 1),
+        initial=first_step, total=args.semantic_iterations,
+        desc="Semantic training",
     )
-    progress = tqdm(range(1, args.semantic_iterations + 1), desc="Semantic training")
     stack = []
     ema = 0.0
     for step in progress:
@@ -190,9 +222,17 @@ def main():
                 loss=f"{ema:.5f}", spatial=f"{spatial_loss.item():.5f}"
             )
         if args.save_every > 0 and step % args.save_every == 0:
-            save_artifact(output_path, logits, scene.loaded_iter, meta)
+            save_artifact(output_path, logits, scene.loaded_iter, step, meta)
+            save_training_checkpoint(checkpoint_path, logits, optimizer, step)
 
-    save_artifact(output_path, logits, scene.loaded_iter, meta)
+    save_artifact(
+        output_path, logits, scene.loaded_iter, args.semantic_iterations, meta
+    )
+    save_training_checkpoint(
+        checkpoint_path, logits, optimizer, args.semantic_iterations
+    )
+    with open(completion_path, "w", encoding="utf-8") as handle:
+        json.dump({"semantic_iterations": args.semantic_iterations}, handle)
     print(f"Saved semantic Gaussians: {output_path}")
 
 

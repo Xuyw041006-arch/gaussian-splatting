@@ -16,6 +16,31 @@ def run(command, cwd):
     subprocess.run([str(value) for value in command], cwd=cwd, check=True)
 
 
+def latest_checkpoint(model, maximum):
+    candidates = []
+    for path in Path(model).glob("chkpnt*.pth"):
+        try:
+            step = int(path.stem.replace("chkpnt", ""))
+        except ValueError:
+            continue
+        if step < int(maximum):
+            candidates.append((step, path))
+    return max(candidates, default=(0, None))[1]
+
+
+def semantic_training_complete(model, iteration, target):
+    marker = (
+        Path(model) / "semantic" / f"iteration_{iteration}"
+        / "training_complete.json"
+    )
+    if not marker.is_file():
+        return False
+    try:
+        return int(json.loads(marker.read_text())["semantic_iterations"]) >= int(target)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark adaptive joint 3DGS on ramen")
     parser.add_argument("--scene", required=True)
@@ -30,6 +55,10 @@ def main():
     parser.add_argument("--skip_training", action="store_true")
     parser.add_argument("--skip_baseline", action="store_true")
     parser.add_argument("--skip_joint", action="store_true")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Reuse preprocessing, completed stages, and the latest training checkpoints",
+    )
     args = parser.parse_args()
 
     if min(args.iterations, args.semantic_iterations, args.feature_dim) < 1:
@@ -50,7 +79,8 @@ def main():
     test_file.write_text("".join(f"{path.name}\n" for path in test_images), encoding="utf-8")
     print("Explicit test views:", [path.name for path in test_images])
 
-    if not args.skip_preprocess:
+    preprocessed = (scene / "semantic_meta.npz").is_file()
+    if not args.skip_preprocess and not (args.resume and preprocessed):
         run([
             sys.executable, repo / "preprocess_semantics.py",
             "--scene", scene, "--images_subdir", "images_train",
@@ -65,7 +95,12 @@ def main():
     # Match the original 30k 3DGS schedule for the full experiment.  The pilot
     # keeps a proportional warm-up while the full run densifies through 15k.
     densify_until = min(15000, max(1000, int(args.iterations * 0.72)))
-    save_iterations = sorted({args.iterations, min(7000, args.iterations), min(15000, args.iterations)})
+    save_iterations = sorted({
+        args.iterations, min(7000, args.iterations), min(15000, args.iterations)
+    })
+    checkpoint_iterations = [
+        step for step in save_iterations if step < args.iterations
+    ]
     common_train = [
         "-s", scene, "--eval", "--iterations", args.iterations,
         "--save_iterations", *save_iterations,
@@ -74,36 +109,76 @@ def main():
         "--densify_until_iter", densify_until, "--densify_grad_threshold", 0.00015,
         "--importance_mask_dir", scene / "importance_masks",
     ]
+    if checkpoint_iterations:
+        common_train.extend(("--checkpoint_iterations", *checkpoint_iterations))
     if not args.skip_training:
         if not args.skip_baseline:
-            run([
-                sys.executable, repo / "train.py", "-m", baseline, *common_train,
-                "--foreground_weight", 3.0, "--background_weight", 0.75,
-            ], repo)
-            run([
-                sys.executable, repo / "train_semantics.py", "-m", baseline,
-                "--iteration", args.iterations,
-                "--semantic_iterations", args.semantic_iterations,
-                "--semantic_lr", 0.005, "--spatial_weight", 0.02,
-                "--spatial_k", 8, "--spatial_samples", 4096,
-            ], repo)
+            baseline_ply = (
+                baseline / "point_cloud" / f"iteration_{args.iterations}"
+                / "point_cloud.ply"
+            )
+            if not (args.resume and baseline_ply.is_file()):
+                command = [
+                    sys.executable, repo / "train.py", "-m", baseline,
+                    *common_train, "--foreground_weight", 3.0,
+                    "--background_weight", 0.75,
+                ]
+                checkpoint = latest_checkpoint(baseline, args.iterations)
+                if args.resume and checkpoint is not None:
+                    command.extend(("--start_checkpoint", checkpoint))
+                run(command, repo)
+            else:
+                print("Reusing completed sequential RGB model", flush=True)
+            if not (
+                args.resume and semantic_training_complete(
+                    baseline, args.iterations, args.semantic_iterations
+                )
+            ):
+                command = [
+                    sys.executable, repo / "train_semantics.py", "-m", baseline,
+                    "--iteration", args.iterations,
+                    "--semantic_iterations", args.semantic_iterations,
+                    "--semantic_lr", 0.005, "--spatial_weight", 0.02,
+                    "--spatial_k", 8, "--spatial_samples", 4096,
+                ]
+                if args.resume:
+                    command.append("--resume")
+                run(command, repo)
+            else:
+                print("Reusing completed sequential semantic model", flush=True)
         if not args.skip_joint:
-            run([
-                sys.executable, repo / "train.py", "-m", joint, *common_train,
-                "--joint_semantics", "--semantic_dir", scene / "semantic_maps",
-                "--sh_degree", 5, "--semantic_start", args.semantic_start,
-                "--semantic_weight", 0.20, "--semantic_lr", 0.01,
-                "--scale_gate_lr", 0.001,
-                "--rgb_tier_weights", 0.35, 1.0, 4.0,
-                "--semantic_tier_weights", 0.15, 1.0, 4.0,
-                "--tier_densify_multipliers", 1.80, 1.0, 0.55,
-                "--tier_opacity_multipliers", 2.0, 1.0, 0.5,
-                "--tier_sh_degrees", 1, 3, 5,
-                "--semantic_spatial_weight", 0.02,
-                "--semantic_spatial_every", 8,
-                "--semantic_spatial_samples", 512,
-                "--semantic_chunks_per_step", 3,
-            ], repo)
+            joint_ply = (
+                joint / "point_cloud" / f"iteration_{args.iterations}"
+                / "point_cloud.ply"
+            )
+            joint_semantic = (
+                joint / "semantic" / f"iteration_{args.iterations}"
+                / "semantic_features.pt"
+            )
+            if not (args.resume and joint_ply.is_file() and joint_semantic.is_file()):
+                command = [
+                    sys.executable, repo / "train.py", "-m", joint,
+                    *common_train,
+                    "--joint_semantics", "--semantic_dir", scene / "semantic_maps",
+                    "--sh_degree", 5, "--semantic_start", args.semantic_start,
+                    "--semantic_weight", 0.20, "--semantic_lr", 0.01,
+                    "--scale_gate_lr", 0.001,
+                    "--rgb_tier_weights", 0.35, 1.0, 4.0,
+                    "--semantic_tier_weights", 0.15, 1.0, 4.0,
+                    "--tier_densify_multipliers", 1.80, 1.0, 0.55,
+                    "--tier_opacity_multipliers", 2.0, 1.0, 0.5,
+                    "--tier_sh_degrees", 1, 3, 5,
+                    "--semantic_spatial_weight", 0.02,
+                    "--semantic_spatial_every", 8,
+                    "--semantic_spatial_samples", 512,
+                    "--semantic_chunks_per_step", 3,
+                ]
+                checkpoint = latest_checkpoint(joint, args.iterations)
+                if args.resume and checkpoint is not None:
+                    command.extend(("--start_checkpoint", checkpoint))
+                run(command, repo)
+            else:
+                print("Reusing completed joint model", flush=True)
 
     results = {}
     for name, model in (("sequential", baseline), ("joint", joint)):

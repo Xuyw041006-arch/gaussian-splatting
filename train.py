@@ -58,8 +58,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    checkpoint_joint_state = None
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        loaded_checkpoint = torch.load(checkpoint)
+        if len(loaded_checkpoint) >= 3:
+            model_params, first_iter, checkpoint_joint_state = loaded_checkpoint[:3]
+        else:
+            model_params, first_iter = loaded_checkpoint
         gaussians.restore(model_params, opt)
 
     joint = None
@@ -68,6 +73,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             raise ValueError("Joint semantic fields currently require the default Adam optimizer")
         from semantic.joint_trainer import JointSemanticSupervisor
         joint = JointSemanticSupervisor(dataset, gaussians, pipe, joint_args)
+        if checkpoint_joint_state is not None:
+            joint.restore_checkpoint_state(checkpoint_joint_state)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -244,7 +251,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                joint_state = joint.checkpoint_state() if joint is not None else None
+                checkpoint_path = (
+                    scene.model_path + "/chkpnt" + str(iteration) + ".pth"
+                )
+                temporary_path = checkpoint_path + ".tmp"
+                torch.save(
+                    (gaussians.capture(), iteration, joint_state),
+                    temporary_path,
+                )
+                os.replace(temporary_path, checkpoint_path)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
