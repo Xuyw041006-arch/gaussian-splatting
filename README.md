@@ -303,11 +303,13 @@ semantic threshold 0.25）：
 已经工作；但短训练下全局画质和边界质量仍落后，不能宣称全面优于现有方法。
 原始指标见 [`benchmarks/ramen_pilot_1500.json`](benchmarks/ramen_pilot_1500.json)，
 完整公式、阈值、限制和下一轮优化见 [`docs/JOINT_MODEL.md`](docs/JOINT_MODEL.md)。
-论文级对比请在 Notebook 中选择 full 模式运行 30,000/5,000 轮；联合语义
-从第 1,000 轮开启，并沿用原始 3DGS 到第 15,000 轮的 densification 日程。
+Notebook 的 full 模式默认运行 15,000/5,000 轮；联合语义从第 1,000 轮开启，
+在第 10,000 轮结束 densification，并保留最后 5,000 轮稳定新分裂的高斯。
+需要复现实验上限时仍可显式传入 `--iterations 30000`，其 densification 截止
+保持第 15,000 轮。
 Notebook 默认将公开数据、SAM 检查点、语义预处理和全部训练结果写入
-`MyDrive/semantic_adaptive_3dgs/ramen_full_30k/`。加上 `--resume` 后，RGB/联合
-训练从最近的 7k 或 15k 检查点继续，顺序语义训练每 1,000 轮保存 Adam 状态；
+`MyDrive/semantic_adaptive_3dgs/ramen_full_15k/`。加上 `--resume` 后，RGB/联合
+训练从最近的 7k 或 10k 检查点继续，顺序语义训练每 1,000 轮保存 Adam 状态；
 浏览器或 Colab 运行时中断不再要求从零开始。
 
 ## 当前边界

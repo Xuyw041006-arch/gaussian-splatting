@@ -46,7 +46,7 @@ def main():
     parser.add_argument("--scene", required=True)
     parser.add_argument("--sam_checkpoint", required=True)
     parser.add_argument("--output_root", required=True)
-    parser.add_argument("--iterations", type=int, default=30000)
+    parser.add_argument("--iterations", type=int, default=15000)
     parser.add_argument("--semantic_iterations", type=int, default=5000)
     parser.add_argument("--semantic_start", type=int, default=1000)
     parser.add_argument("--feature_dim", type=int, default=32)
@@ -92,11 +92,13 @@ def main():
             "--cross_view_prototypes", 64, "--cross_view_weight", 0.65,
         ], repo)
 
-    # Match the original 30k 3DGS schedule for the full experiment.  The pilot
-    # keeps a proportional warm-up while the full run densifies through 15k.
-    densify_until = min(15000, max(1000, int(args.iterations * 0.72)))
+    # Finish densification before the final third of training so newly split
+    # Gaussians still receive enough RGB and semantic refinement.  This keeps
+    # the original 15k cutoff for 30k runs and uses 10k for the 15k default.
+    densify_until = min(15000, max(1000, int(args.iterations * 2 / 3)))
     save_iterations = sorted({
-        args.iterations, min(7000, args.iterations), min(15000, args.iterations)
+        args.iterations, min(7000, args.iterations),
+        min(10000, args.iterations), min(15000, args.iterations)
     })
     checkpoint_iterations = [
         step for step in save_iterations if step < args.iterations
