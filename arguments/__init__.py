@@ -58,6 +58,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.max_train_views = -1
         self.view_stride = 1
+        self.validation_file = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

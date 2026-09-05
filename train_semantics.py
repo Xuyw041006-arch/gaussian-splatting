@@ -2,6 +2,7 @@
 
 import os
 import json
+import time
 from argparse import ArgumentParser
 from functools import lru_cache
 from pathlib import Path
@@ -75,6 +76,10 @@ def main():
     parser.add_argument("--semantic_iterations", type=int, default=5000)
     parser.add_argument("--semantic_lr", type=float, default=0.01)
     parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument(
+        "--max_seconds", type=float, default=0.0,
+        help="Optional wall-clock budget; zero disables the limit",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--spatial_weight", type=float, default=0.02)
     parser.add_argument("--spatial_k", type=int, default=8)
@@ -98,6 +103,8 @@ def main():
         parser.error("Run preprocess_semantics.py before train_semantics.py")
     if args.semantic_iterations < 1 or args.semantic_lr <= 0:
         parser.error("Semantic iterations and learning rate must be positive")
+    if args.max_seconds < 0:
+        parser.error("--max_seconds must be non-negative")
     if args.spatial_weight < 0 or args.spatial_k < 1 or args.spatial_samples < 1:
         parser.error("Spatial weight must be non-negative; k and samples must be positive")
     if args.spatial_color_sigma <= 0 or not 0 <= args.min_alpha < 1:
@@ -156,7 +163,11 @@ def main():
     )
     stack = []
     ema = 0.0
+    training_started = time.monotonic()
+    final_step = first_step
+    stopped_by_time = False
     for step in progress:
+        final_step = step
         if not stack:
             stack = available.copy()
         camera = stack.pop(randint(0, len(stack) - 1))
@@ -224,15 +235,28 @@ def main():
         if args.save_every > 0 and step % args.save_every == 0:
             save_artifact(output_path, logits, scene.loaded_iter, step, meta)
             save_training_checkpoint(checkpoint_path, logits, optimizer, step)
+        if args.max_seconds > 0 and time.monotonic() - training_started >= args.max_seconds:
+            stopped_by_time = True
+            print(
+                f"Reached semantic wall-clock budget after step {step} "
+                f"({time.monotonic() - training_started:.1f}s)"
+            )
+            break
 
     save_artifact(
-        output_path, logits, scene.loaded_iter, args.semantic_iterations, meta
+        output_path, logits, scene.loaded_iter, final_step, meta
     )
     save_training_checkpoint(
-        checkpoint_path, logits, optimizer, args.semantic_iterations
+        checkpoint_path, logits, optimizer, final_step
     )
     with open(completion_path, "w", encoding="utf-8") as handle:
-        json.dump({"semantic_iterations": args.semantic_iterations}, handle)
+        json.dump({
+            "semantic_iterations": final_step,
+            "requested_semantic_iterations": args.semantic_iterations,
+            "elapsed_seconds": time.monotonic() - training_started,
+            "max_seconds": args.max_seconds,
+            "stopped_by_time": stopped_by_time,
+        }, handle, indent=2)
     print(f"Saved semantic Gaussians: {output_path}")
 
 

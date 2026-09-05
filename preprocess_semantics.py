@@ -8,8 +8,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.decomposition import PCA
 from tqdm import tqdm
 
 
@@ -75,15 +73,25 @@ def build_hierarchy_region_maps(regions, size, image_area, fine_ratio=0.05, coar
     )
 
 
-def aggregate_cross_view_features(features, confidences, max_prototypes=64, weight=0.65):
+def aggregate_cross_view_features(
+    features, confidences, max_prototypes=64, weight=0.65,
+    return_centers=False,
+):
     """LaGa-inspired scene prototypes suppress view-specific CLIP noise."""
     features = np.asarray(features, dtype=np.float32)
     confidences = np.asarray(confidences, dtype=np.float32)
     if len(features) < 2 or max_prototypes < 1 or weight <= 0:
-        return (
+        result = (
             features.copy(), np.zeros(len(features), dtype=np.int32),
             np.zeros(len(features), dtype=np.float32),
         )
+        if return_centers:
+            centers = features[:1].copy() if len(features) else np.zeros(
+                (0, features.shape[-1]), dtype=np.float32
+            )
+            return (*result, centers)
+        return result
+    from sklearn.cluster import MiniBatchKMeans
     clusters = min(int(max_prototypes), max(2, int(round(np.sqrt(len(features))))))
     model = MiniBatchKMeans(
         n_clusters=clusters, random_state=42,
@@ -104,7 +112,92 @@ def aggregate_cross_view_features(features, confidences, max_prototypes=64, weig
     )
     aggregated = (1.0 - blend[:, None]) * features + blend[:, None] * centers[labels]
     aggregated /= np.maximum(np.linalg.norm(aggregated, axis=1, keepdims=True), 1e-8)
-    return aggregated.astype(np.float32), labels.astype(np.int32), blend.astype(np.float32)
+    result = (
+        aggregated.astype(np.float32), labels.astype(np.int32),
+        blend.astype(np.float32),
+    )
+    return (*result, centers) if return_centers else result
+
+
+def _expand_binary(mask, iterations):
+    """Small dependency-free 8-neighbour dilation for feature-resolution maps."""
+    expanded = np.asarray(mask, dtype=bool)
+    for _ in range(max(0, int(iterations))):
+        padded = np.pad(expanded, 1, mode="constant")
+        expanded = np.logical_or.reduce([
+            padded[y:y + expanded.shape[0], x:x + expanded.shape[1]]
+            for y in range(3) for x in range(3)
+        ])
+    return expanded
+
+
+def build_detail_supervision(
+    region_map, importance, boundary_width=2, boundary_boost=1.75,
+    thin_boost=1.25, thin_compactness=0.35, thin_aspect_ratio=3.0,
+):
+    """Create boundary/thin-object weights and promote their densification tier.
+
+    Thinness combines region compactness and bounding-box aspect ratio.  The
+    implementation intentionally uses NumPy only so preprocessing behaves the
+    same in Colab and minimal local test environments.
+    """
+    region_map = np.asarray(region_map)
+    enhanced = np.asarray(importance, dtype=np.uint8).copy()
+    height, width = region_map.shape
+    boundary = np.zeros((height, width), dtype=bool)
+    boundary[:-1] |= region_map[:-1] != region_map[1:]
+    boundary[1:] |= region_map[:-1] != region_map[1:]
+    boundary[:, :-1] |= region_map[:, :-1] != region_map[:, 1:]
+    boundary[:, 1:] |= region_map[:, :-1] != region_map[:, 1:]
+    boundary &= region_map >= 0
+    boundary = _expand_binary(boundary, max(0, int(boundary_width) - 1))
+    boundary &= region_map >= 0
+
+    thinness = np.zeros((height, width), dtype=np.float32)
+    for region_id in np.unique(region_map[region_map >= 0]):
+        mask = region_map == region_id
+        ys, xs = np.nonzero(mask)
+        area = float(len(xs))
+        if area < 2:
+            score = 1.0
+        else:
+            box_height = float(ys.max() - ys.min() + 1)
+            box_width = float(xs.max() - xs.min() + 1)
+            aspect = max(box_height, box_width) / max(min(box_height, box_width), 1.0)
+            perimeter = float(
+                np.count_nonzero(mask[:-1] != mask[1:])
+                + np.count_nonzero(mask[:, :-1] != mask[:, 1:])
+                + 2 * np.count_nonzero(mask[0]) + 2 * np.count_nonzero(mask[:, 0])
+            )
+            compactness = 4.0 * np.pi * area / max(perimeter * perimeter, 1.0)
+            compactness_score = np.clip(
+                (float(thin_compactness) - compactness)
+                / max(float(thin_compactness), 1e-6), 0.0, 1.0
+            )
+            aspect_score = np.clip(
+                (aspect - float(thin_aspect_ratio))
+                / max(2.0 * float(thin_aspect_ratio), 1e-6), 0.0, 1.0
+            )
+            score = float(max(compactness_score, aspect_score))
+        if score > 0:
+            thinness[mask] = score
+            enhanced[mask] = np.maximum(enhanced[mask], 1)
+
+    # Preserve both sides of meaningful object boundaries.  Important-object
+    # boundaries remain tier 2; other SAM boundaries become at least tier 1.
+    important_nearby = _expand_binary(importance >= 2, boundary_width) & boundary
+    enhanced[boundary] = np.maximum(enhanced[boundary], 1)
+    enhanced[important_nearby] = 2
+    tier_scale = 0.65 + 0.175 * enhanced.astype(np.float32)
+    detail_weight = (
+        1.0
+        + float(boundary_boost) * boundary.astype(np.float32) * tier_scale
+        + float(thin_boost) * thinness * tier_scale
+    )
+    return (
+        detail_weight.astype(np.float32), boundary,
+        thinness.astype(np.float32), enhanced,
+    )
 
 
 def select_prompt_regions(features, text_features, threshold, topk):
@@ -170,8 +263,13 @@ def main():
     parser.add_argument("--fine_area_ratio", type=float, default=0.05)
     parser.add_argument("--coarse_area_ratio", type=float, default=0.25)
     parser.add_argument("--background_area_ratio", type=float, default=0.80)
-    parser.add_argument("--cross_view_prototypes", type=int, default=64)
-    parser.add_argument("--cross_view_weight", type=float, default=0.65)
+    parser.add_argument("--cross_view_prototypes", type=int, default=96)
+    parser.add_argument("--cross_view_weight", type=float, default=0.72)
+    parser.add_argument("--boundary_width", type=int, default=3)
+    parser.add_argument("--boundary_boost", type=float, default=2.25)
+    parser.add_argument("--thin_boost", type=float, default=1.50)
+    parser.add_argument("--thin_compactness", type=float, default=0.40)
+    parser.add_argument("--thin_aspect_ratio", type=float, default=2.5)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -187,6 +285,11 @@ def main():
         parser.error("cross-view prototypes must be positive and weight must be in [0, 1]")
     if args.sam_confidence_power <= 0 or not 0 <= args.sam_confidence_floor <= 1:
         parser.error("SAM confidence power must be positive and floor must be in [0, 1]")
+    if (
+        args.boundary_width < 1 or args.boundary_boost < 0 or args.thin_boost < 0
+        or args.thin_compactness <= 0 or args.thin_aspect_ratio <= 1
+    ):
+        parser.error("Boundary/thin-object parameters are invalid")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error("CUDA was requested but is unavailable")
     scene = Path(args.scene).resolve()
@@ -203,6 +306,7 @@ def main():
     try:
         import open_clip
         from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+        from sklearn.decomposition import PCA
     except ImportError as error:
         parser.error(
             f"Missing semantic dependency ({error}). Install requirements-semantic.txt."
@@ -225,9 +329,13 @@ def main():
     raw_dir = scene / "semantic_raw"
     maps_dir = scene / "semantic_maps"
     importance_dir = scene / "importance_masks"
+    detail_dir = scene / "detail_weights"
+    boundary_dir = scene / "boundary_masks"
     raw_dir.mkdir(exist_ok=True)
     maps_dir.mkdir(exist_ok=True)
     importance_dir.mkdir(exist_ok=True)
+    detail_dir.mkdir(exist_ok=True)
+    boundary_dir.mkdir(exist_ok=True)
 
     prompts = parse_prompts(args.important)
     normal_prompts = parse_prompts(args.normal)
@@ -319,9 +427,9 @@ def main():
     stacked_confidence = np.concatenate(
         [record["confidences"] for record in records], axis=0
     )
-    stacked, prototype_ids, prototype_weights = aggregate_cross_view_features(
+    stacked, prototype_ids, prototype_weights, prototype_centers = aggregate_cross_view_features(
         stacked_raw, stacked_confidence,
-        args.cross_view_prototypes, args.cross_view_weight,
+        args.cross_view_prototypes, args.cross_view_weight, return_centers=True,
     )
     dimensions = min(args.feature_dim, stacked.shape[0], stacked.shape[1])
     if dimensions < 3:
@@ -331,10 +439,18 @@ def main():
     feature_min = projected.min(axis=0)
     feature_max = projected.max(axis=0)
     feature_range = np.maximum(feature_max - feature_min, 1e-6)
+    encoded_prototypes = (
+        pca.transform(prototype_centers) - feature_min
+    ) / feature_range
+    encoded_prototypes = np.clip(encoded_prototypes, 0.0, 1.0)
 
     offset = 0
     confidence_values = []
     tier_counts = np.zeros(3, dtype=np.int64)
+    detail_statistics = {
+        "valid_pixels": 0, "boundary_pixels": 0,
+        "thinness_sum": 0.0, "detail_weight_sum": 0.0,
+    }
     for record in tqdm(records, desc="Dense semantic maps"):
         path = record["path"]
         confidences = record["confidences"]
@@ -342,6 +458,7 @@ def main():
             region_map = raw["region_map"]
             hierarchy_region_maps = raw["hierarchy_region_maps"]
         count = len(record["features"])
+        current_prototype_ids = prototype_ids[offset:offset + count]
         encoded = (projected[offset:offset + count] - feature_min) / feature_range
         aggregated_features = stacked[offset:offset + count]
         offset += count
@@ -385,9 +502,41 @@ def main():
         importance = np.zeros(region_map.shape, dtype=np.uint8)
         importance[np.isin(region_map, list(normal_regions))] = 1
         importance[np.isin(region_map, list(important_regions))] = 2
+        detail_weight, boundary, thinness, importance = build_detail_supervision(
+            region_map, importance,
+            boundary_width=args.boundary_width,
+            boundary_boost=args.boundary_boost,
+            thin_boost=args.thin_boost,
+            thin_compactness=args.thin_compactness,
+            thin_aspect_ratio=args.thin_aspect_ratio,
+        )
+        detail_statistics["valid_pixels"] += int(valid.sum())
+        detail_statistics["boundary_pixels"] += int(boundary.sum())
+        detail_statistics["thinness_sum"] += float(thinness[valid].sum())
+        detail_statistics["detail_weight_sum"] += float(
+            detail_weight[valid].sum()
+        )
+        prototype_map = np.full(region_map.shape, -1, dtype=np.int16)
+        prototype_map[valid] = current_prototype_ids[region_map[valid]]
+        hierarchy_prototype_ids = np.full(
+            hierarchy_region_maps.shape, -1, dtype=np.int16
+        )
+        for level in range(3):
+            level_valid = hierarchy_valid[level]
+            hierarchy_prototype_ids[level, level_valid] = current_prototype_ids[
+                hierarchy_region_maps[level, level_valid]
+            ]
         tier_counts += np.bincount(importance.reshape(-1), minlength=3)[:3]
         Image.fromarray(np.take([0, 127, 255], importance).astype(np.uint8)).save(
             importance_dir / f"{path.stem}.png"
+        )
+        detail_preview = np.clip(
+            255.0 * (detail_weight - 1.0)
+            / max(float(detail_weight.max() - 1.0), 1e-6), 0, 255
+        ).astype(np.uint8)
+        Image.fromarray(detail_preview).save(detail_dir / f"{path.stem}.png")
+        Image.fromarray(boundary.astype(np.uint8) * 255).save(
+            boundary_dir / f"{path.stem}.png"
         )
         np.savez_compressed(
             maps_dir / f"{path.stem}.npz",
@@ -398,6 +547,11 @@ def main():
             hierarchy_valid=hierarchy_valid.astype(np.uint8),
             hierarchy_confidence=hierarchy_confidence.astype(np.float16),
             importance=importance,
+            detail_weight=detail_weight.astype(np.float16),
+            boundary=boundary.astype(np.uint8),
+            thinness=thinness.astype(np.float16),
+            prototype_ids=prototype_map,
+            hierarchy_prototype_ids=hierarchy_prototype_ids,
         )
 
     np.savez(
@@ -408,6 +562,7 @@ def main():
         feature_max=feature_max.astype(np.float32),
         clip_model=np.array(args.clip_model),
         clip_pretrained=np.array(args.clip_pretrained),
+        prototype_features=encoded_prototypes.astype(np.float32),
     )
     summary = {
         "images": len(paths), "regions": int(stacked.shape[0]),
@@ -418,6 +573,28 @@ def main():
         "mean_sam_confidence": float(np.mean(confidence_values)),
         "cross_view_prototypes": int(prototype_ids.max() + 1),
         "mean_prototype_blend": float(prototype_weights.mean()),
+        "boundary": {
+            "width": args.boundary_width, "boost": args.boundary_boost,
+        },
+        "thin_objects": {
+            "boost": args.thin_boost,
+            "compactness_threshold": args.thin_compactness,
+            "aspect_ratio_threshold": args.thin_aspect_ratio,
+        },
+        "detail_statistics": {
+            "boundary_pixel_ratio": (
+                detail_statistics["boundary_pixels"]
+                / max(detail_statistics["valid_pixels"], 1)
+            ),
+            "mean_thinness": (
+                detail_statistics["thinness_sum"]
+                / max(detail_statistics["valid_pixels"], 1)
+            ),
+            "mean_detail_weight": (
+                detail_statistics["detail_weight_sum"]
+                / max(detail_statistics["valid_pixels"], 1)
+            ),
+        },
         "granularity_area_ratios": {
             "fine": args.fine_area_ratio, "coarse": args.coarse_area_ratio,
         },
@@ -427,6 +604,7 @@ def main():
         "important_json": str(Path(args.important_json).resolve()) if args.important_json else None,
         "images_subdir": args.images_subdir,
         "semantic_maps": str(maps_dir), "importance_masks": str(importance_dir),
+        "detail_weights": str(detail_dir), "boundary_masks": str(boundary_dir),
     }
     with open(scene / "semantic_summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)

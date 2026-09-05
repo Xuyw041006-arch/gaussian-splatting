@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import json
 import os
 import torch
 from random import randint
@@ -90,10 +91,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     importance_cache = {}
+    validation_history = []
+    best_val_psnr = float("-inf")
+    best_val_iteration = 0
+    validation_without_improvement = 0
+    early_stopped = False
+    trained_iteration = first_iter
+    best_validation_checkpoint = os.path.join(
+        scene.model_path, "best_val_chkpnt.pth"
+    )
+    validation_summary_path = os.path.join(
+        scene.model_path, "validation_summary.json"
+    )
+    if checkpoint and os.path.isfile(validation_summary_path):
+        try:
+            with open(validation_summary_path, encoding="utf-8") as handle:
+                previous_validation = json.load(handle)
+            validation_history = [
+                item for item in previous_validation.get("history", [])
+                if int(item.get("iteration", 0)) <= first_iter
+            ]
+            best_val_iteration = int(
+                previous_validation.get("best_iteration", 0)
+            )
+            best_val_psnr = float(
+                previous_validation.get("best_psnr", float("-inf"))
+            )
+            validation_without_improvement = sum(
+                int(item.get("iteration", 0)) > best_val_iteration
+                for item in validation_history
+            )
+            print(
+                f"Restored validation history through iteration {first_iter}; "
+                f"best is {best_val_iteration}"
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            print("Ignoring unreadable previous validation history")
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+        trained_iteration = iteration
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -249,6 +287,89 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     joint.step()
                     gaussians.enforce_sh_capacity(*joint_args.tier_sh_degrees)
 
+            if (
+                joint_args.validation_interval > 0
+                and scene.getValCameras()
+                and iteration >= joint_args.validation_start
+                and iteration % joint_args.validation_interval == 0
+            ):
+                validation_psnr = evaluate_camera_psnr(
+                    scene.getValCameras(), scene, render,
+                    (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None,
+                    dataset.train_test_exp), dataset.train_test_exp,
+                )
+                validation_record = {
+                    "iteration": int(iteration),
+                    "psnr": float(validation_psnr),
+                    "gaussians": int(gaussians.get_xyz.shape[0]),
+                }
+                if joint is not None and iteration >= joint_args.semantic_start:
+                    semantic_values = []
+                    cross_view_values = []
+                    semantic_eval_iteration = iteration
+                    while semantic_eval_iteration % 3 != 1:
+                        semantic_eval_iteration += 1
+                    if (
+                        joint_args.semantic_spatial_every > 1
+                        and semantic_eval_iteration
+                        % joint_args.semantic_spatial_every == 0
+                    ):
+                        semantic_eval_iteration += 3
+                    for validation_camera in scene.getValCameras():
+                        semantic_result = joint.compute(
+                            validation_camera, semantic_eval_iteration
+                        )
+                        if semantic_result is not None:
+                            semantic_values.append(
+                                float(semantic_result["data_loss"])
+                            )
+                            cross_view_values.append(
+                                float(semantic_result["cross_view_loss"])
+                            )
+                    if semantic_values:
+                        validation_record["semantic_l1"] = sum(
+                            semantic_values
+                        ) / len(semantic_values)
+                        validation_record["cross_view_l1"] = sum(
+                            cross_view_values
+                        ) / len(cross_view_values)
+                validation_history.append(validation_record)
+                print(
+                    f"\n[ITER {iteration}] Validation PSNR {validation_psnr:.6f} "
+                    f"({gaussians.get_xyz.shape[0]} Gaussians)"
+                )
+                if validation_psnr > best_val_psnr + joint_args.early_stop_min_delta:
+                    best_val_psnr = validation_psnr
+                    best_val_iteration = iteration
+                    validation_without_improvement = 0
+                    temporary_path = best_validation_checkpoint + ".tmp"
+                    torch.save(
+                        (
+                            gaussians.capture(), iteration,
+                            joint.checkpoint_state() if joint is not None else None,
+                        ),
+                        temporary_path,
+                    )
+                    os.replace(temporary_path, best_validation_checkpoint)
+                else:
+                    validation_without_improvement += 1
+                write_validation_summary(
+                    scene.model_path, validation_history, best_val_iteration,
+                    best_val_psnr, iteration, False,
+                )
+                if (
+                    joint_args.early_stop_patience > 0
+                    and validation_without_improvement
+                    >= joint_args.early_stop_patience
+                ):
+                    early_stopped = True
+                    print(
+                        f"Early stopping at {iteration}; best validation PSNR "
+                        f"was {best_val_psnr:.6f} at iteration {best_val_iteration}"
+                    )
+                    progress_bar.close()
+                    break
+
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 joint_state = joint.checkpoint_state() if joint is not None else None
@@ -261,6 +382,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     temporary_path,
                 )
                 os.replace(temporary_path, checkpoint_path)
+
+    if (
+        joint_args.select_best_validation
+        and best_val_iteration > 0
+        and os.path.isfile(best_validation_checkpoint)
+    ):
+        best_model, _, best_joint_state = torch.load(best_validation_checkpoint)
+        gaussians.restore(best_model, opt)
+        if joint is not None:
+            joint.restore_checkpoint_state(best_joint_state)
+        # Keep the conventional requested-iteration path as a stable alias so
+        # render/evaluation scripts need no special-case for early stopping.
+        scene.save(opt.iterations)
+        if joint is not None:
+            joint.save(opt.iterations)
+        print(
+            f"Selected validation-best iteration {best_val_iteration} and saved "
+            f"it as iteration_{opt.iterations}"
+        )
+    if validation_history:
+        write_validation_summary(
+            scene.model_path, validation_history, best_val_iteration,
+            best_val_psnr, trained_iteration, early_stopped,
+            selected_alias=opt.iterations if joint_args.select_best_validation else None,
+        )
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -284,6 +430,42 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+@torch.no_grad()
+def evaluate_camera_psnr(cameras, scene, render_func, render_args, train_test_exp):
+    total = 0.0
+    for viewpoint in cameras:
+        image = torch.clamp(
+            render_func(viewpoint, scene.gaussians, *render_args)["render"], 0.0, 1.0
+        )
+        target = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+        if train_test_exp:
+            image = image[..., image.shape[-1] // 2:]
+            target = target[..., target.shape[-1] // 2:]
+        total += float(psnr(image, target).mean())
+    return total / max(len(cameras), 1)
+
+
+def write_validation_summary(
+    model_path, history, best_iteration, best_psnr, trained_iteration,
+    early_stopped, selected_alias=None,
+):
+    output = os.path.join(model_path, "validation_summary.json")
+    temporary = output + ".tmp"
+    payload = {
+        "history": history,
+        "best_iteration": int(best_iteration),
+        "best_psnr": float(best_psnr),
+        "trained_iterations": int(trained_iteration),
+        "early_stopped": bool(early_stopped),
+        "selected_iteration_alias": (
+            int(selected_alias) if selected_alias is not None else None
+        ),
+    }
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    os.replace(temporary, output)
+
+
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
@@ -293,7 +475,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
+                              {'name': 'validation', 'cameras': scene.getValCameras()},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
@@ -349,31 +532,38 @@ if __name__ == "__main__":
     parser.add_argument("--joint_semantics", action="store_true")
     parser.add_argument("--semantic_dir", default="")
     parser.add_argument("--semantic_start", type=int, default=1000)
-    parser.add_argument("--semantic_weight", type=float, default=0.15)
+    parser.add_argument("--semantic_weight", type=float, default=0.22)
     parser.add_argument("--semantic_lr", type=float, default=0.005)
     parser.add_argument("--scale_gate_lr", type=float, default=0.001)
     parser.add_argument("--semantic_min_alpha", type=float, default=0.05)
-    parser.add_argument("--semantic_spatial_weight", type=float, default=0.02)
+    parser.add_argument("--semantic_spatial_weight", type=float, default=0.012)
     parser.add_argument("--semantic_spatial_every", type=int, default=8)
-    parser.add_argument("--semantic_spatial_samples", type=int, default=512)
+    parser.add_argument("--semantic_spatial_samples", type=int, default=768)
+    parser.add_argument("--semantic_edge_sigma", type=float, default=0.12)
+    parser.add_argument("--semantic_cross_view_weight", type=float, default=0.06)
     parser.add_argument("--semantic_chunks_per_step", type=int, default=3)
     parser.add_argument("--importance_ema", type=float, default=0.90)
+    parser.add_argument("--validation_interval", type=int, default=0)
+    parser.add_argument("--validation_start", type=int, default=0)
+    parser.add_argument("--early_stop_patience", type=int, default=0)
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.02)
+    parser.add_argument("--select_best_validation", action="store_true")
     parser.add_argument(
-        "--rgb_tier_weights", nargs=3, type=float, default=(0.35, 1.0, 4.0),
+        "--rgb_tier_weights", nargs=3, type=float, default=(0.30, 1.20, 5.0),
         metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
     )
     parser.add_argument(
-        "--semantic_tier_weights", nargs=3, type=float, default=(0.15, 1.0, 4.0),
+        "--semantic_tier_weights", nargs=3, type=float, default=(0.12, 1.25, 5.0),
         metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
     )
     parser.add_argument(
         "--tier_densify_multipliers", nargs=3, type=float,
-        default=(1.80, 1.0, 0.55),
+        default=(1.25, 0.72, 0.35),
         metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
     )
     parser.add_argument(
         "--tier_opacity_multipliers", nargs=3, type=float,
-        default=(2.0, 1.0, 0.5),
+        default=(1.25, 0.70, 0.25),
         metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
     )
     parser.add_argument(
@@ -403,7 +593,8 @@ if __name__ == "__main__":
             list(args.rgb_tier_weights) + list(args.semantic_tier_weights)
             + list(args.tier_densify_multipliers)
             + list(args.tier_opacity_multipliers)
-            + [args.semantic_weight, args.semantic_lr, args.scale_gate_lr]
+            + [args.semantic_weight, args.semantic_lr, args.scale_gate_lr,
+               args.semantic_edge_sigma]
         )
         if min(positive) <= 0:
             parser.error("Joint semantic weights and learning rates must be positive")
@@ -416,6 +607,12 @@ if __name__ == "__main__":
             parser.error("EMA and minimum alpha must be in [0, 1)")
         if max(args.tier_sh_degrees) > args.sh_degree:
             parser.error("--sh_degree must cover every --tier_sh_degrees value")
+    if (
+        args.validation_interval < 0 or args.validation_start < 0
+        or args.early_stop_patience < 0 or args.early_stop_min_delta < 0
+        or args.semantic_cross_view_weight < 0
+    ):
+        parser.error("Validation and cross-view parameters must be non-negative")
     training(
         lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations,
         args.save_iterations, args.checkpoint_iterations, args.start_checkpoint,

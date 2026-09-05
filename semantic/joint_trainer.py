@@ -46,6 +46,11 @@ class JointSemanticSupervisor:
             self.scale_gate.parameters(), lr=args.scale_gate_lr
         )
         self.background = torch.zeros(3, dtype=torch.float32, device="cuda")
+        self.prototype_features = None
+        if "prototype_features" in self.meta:
+            self.prototype_features = torch.from_numpy(
+                self.meta["prototype_features"].astype(np.float32)
+            ).cuda()
 
     def map_path(self, camera):
         return self.semantic_dir / f"{Path(camera.image_name).stem}.npz"
@@ -73,11 +78,15 @@ class JointSemanticSupervisor:
             return None
         supervision = load_joint_map(str(path))
         level = granularity_for_step(iteration)
-        target, valid, confidence = select_granularity(supervision, level)
+        target, valid, confidence, prototype_ids = select_granularity(
+            supervision, level
+        )
         target = target.cuda(non_blocking=True)
         valid = valid.cuda(non_blocking=True)
         confidence = confidence.cuda(non_blocking=True)
         tiers = supervision["importance"].cuda(non_blocking=True)
+        detail_weight = supervision["detail_weight"].cuda(non_blocking=True)
+        prototype_ids = prototype_ids.cuda(non_blocking=True)
 
         height, width = target.shape[-2:]
         original_size = (camera.image_height, camera.image_width)
@@ -96,8 +105,13 @@ class JointSemanticSupervisor:
             active = valid & (alpha[0] >= self.args.semantic_min_alpha)
             if not active.any():
                 return None
-            weights = confidence * tier_weights(tiers, self.args.semantic_tier_weights)
+            weights = (
+                confidence
+                * tier_weights(tiers, self.args.semantic_tier_weights)
+                * detail_weight
+            )
             chunk_losses = []
+            cross_view_losses = []
             packages = []
             first_chunk = (iteration * self.args.semantic_chunks_per_step) % chunks
             for offset in range(min(self.args.semantic_chunks_per_step, chunks)):
@@ -117,16 +131,36 @@ class JointSemanticSupervisor:
                     (error[active] * weights[active]).sum()
                     / weights[active].sum().clamp_min(1e-8)
                 )
+                if self.prototype_features is not None:
+                    prototype_valid = active & (prototype_ids >= 0)
+                    if prototype_valid.any():
+                        prototype_target = self.prototype_features[
+                            prototype_ids[prototype_valid]
+                        ][:, start:stop].T
+                        prototype_error = torch.abs(
+                            prediction[:, prototype_valid] - prototype_target
+                        ).mean(dim=0)
+                        prototype_weights = weights[prototype_valid]
+                        cross_view_losses.append(
+                            (prototype_error * prototype_weights).sum()
+                            / prototype_weights.sum().clamp_min(1e-8)
+                        )
                 packages.append(semantic_package)
             data_loss = torch.stack(chunk_losses).mean()
+            cross_view_loss = (
+                torch.stack(cross_view_losses).mean()
+                if cross_view_losses else prediction.new_zeros(())
+            )
 
             spatial_loss = prediction.new_zeros(())
             if iteration % self.args.semantic_spatial_every == 0:
                 spatial_loss = local_semantic_consistency(
-                    self.gaussians, self.args.semantic_spatial_samples
+                    self.gaussians, self.args.semantic_spatial_samples,
+                    self.args.semantic_edge_sigma,
                 )
             loss = (
                 self.args.semantic_weight * data_loss
+                + self.args.semantic_cross_view_weight * cross_view_loss
                 + self.args.semantic_spatial_weight
                 * self.args.semantic_spatial_every * spatial_loss
             )
@@ -134,6 +168,7 @@ class JointSemanticSupervisor:
                 "loss": loss,
                 "data_loss": data_loss.detach(),
                 "spatial_loss": spatial_loss.detach(),
+                "cross_view_loss": cross_view_loss.detach(),
                 "packages": packages,
                 "level": level,
                 "chunks": [
@@ -189,6 +224,10 @@ class JointSemanticSupervisor:
             "tier_rgb_weights": tuple(self.args.rgb_tier_weights),
             "tier_semantic_weights": tuple(self.args.semantic_tier_weights),
             "tier_sh_degrees": tuple(self.args.tier_sh_degrees),
+            "semantic_cross_view_weight": float(
+                self.args.semantic_cross_view_weight
+            ),
+            "semantic_edge_sigma": float(self.args.semantic_edge_sigma),
         }
         torch.save(artifact, output)
         return output

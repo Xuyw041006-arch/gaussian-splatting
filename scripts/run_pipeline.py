@@ -42,6 +42,11 @@ def build_steps(args):
         "--batch_size", str(args.clip_batch_size),
         "--cross_view_prototypes", str(args.cross_view_prototypes),
         "--cross_view_weight", str(args.cross_view_weight),
+        "--boundary_width", str(args.boundary_width),
+        "--boundary_boost", str(args.boundary_boost),
+        "--thin_boost", str(args.thin_boost),
+        "--thin_compactness", str(args.thin_compactness),
+        "--thin_aspect_ratio", str(args.thin_aspect_ratio),
     ]
     if args.important:
         semantics.extend(["--important", args.important])
@@ -80,6 +85,8 @@ def build_steps(args):
             "--semantic_spatial_weight", str(args.spatial_weight),
             "--semantic_spatial_every", str(args.spatial_every),
             "--semantic_spatial_samples", str(args.joint_spatial_samples),
+            "--semantic_edge_sigma", str(args.semantic_edge_sigma),
+            "--semantic_cross_view_weight", str(args.semantic_cross_view_weight),
             "--semantic_chunks_per_step", str(args.semantic_chunks_per_step),
             "--importance_ema", str(args.importance_ema),
             "--rgb_tier_weights", *map(str, args.rgb_tier_weights),
@@ -87,6 +94,18 @@ def build_steps(args):
             "--tier_densify_multipliers", *map(str, args.tier_densify_multipliers),
             "--tier_opacity_multipliers", *map(str, args.tier_opacity_multipliers),
             "--tier_sh_degrees", *map(str, args.tier_sh_degrees),
+        ])
+    if args.validation_file:
+        validation_file = Path(args.validation_file)
+        if not validation_file.is_absolute():
+            validation_file = scene / validation_file
+        rgb.extend([
+            "--validation_file", str(validation_file),
+            "--validation_interval", str(args.validation_interval),
+            "--validation_start", str(args.validation_start),
+            "--early_stop_patience", str(args.early_stop_patience),
+            "--early_stop_min_delta", str(args.early_stop_min_delta),
+            "--select_best_validation",
         ])
     if args.depths:
         rgb.extend(["-d", args.depths])
@@ -148,34 +167,49 @@ def make_parser():
     parser.add_argument("--max_masks", type=int, default=192)
     parser.add_argument("--points_per_side", type=int, default=32)
     parser.add_argument("--clip_batch_size", type=int, default=16)
-    parser.add_argument("--scene_iterations", type=int, default=40000)
-    parser.add_argument("--semantic_iterations", type=int, default=8000)
+    parser.add_argument("--scene_iterations", type=int, default=15000)
+    parser.add_argument("--semantic_iterations", type=int, default=5000)
     parser.add_argument("--semantic_lr", type=float, default=0.005)
-    parser.add_argument("--spatial_weight", type=float, default=0.02)
+    parser.add_argument("--spatial_weight", type=float, default=0.012)
     parser.add_argument("--spatial_k", type=int, default=8)
     parser.add_argument("--spatial_samples", type=int, default=4096)
-    parser.add_argument("--cross_view_prototypes", type=int, default=64)
-    parser.add_argument("--cross_view_weight", type=float, default=0.65)
+    parser.add_argument("--cross_view_prototypes", type=int, default=96)
+    parser.add_argument("--cross_view_weight", type=float, default=0.72)
+    parser.add_argument("--boundary_width", type=int, default=3)
+    parser.add_argument("--boundary_boost", type=float, default=2.25)
+    parser.add_argument("--thin_boost", type=float, default=1.50)
+    parser.add_argument("--thin_compactness", type=float, default=0.40)
+    parser.add_argument("--thin_aspect_ratio", type=float, default=2.5)
     parser.add_argument("--joint_sh_degree", type=int, default=5)
     parser.add_argument("--semantic_start", type=int, default=1000)
-    parser.add_argument("--joint_semantic_weight", type=float, default=0.15)
+    parser.add_argument("--joint_semantic_weight", type=float, default=0.22)
     parser.add_argument("--scale_gate_lr", type=float, default=0.001)
     parser.add_argument("--spatial_every", type=int, default=8)
-    parser.add_argument("--joint_spatial_samples", type=int, default=512)
+    parser.add_argument("--joint_spatial_samples", type=int, default=768)
+    parser.add_argument("--semantic_edge_sigma", type=float, default=0.12)
+    parser.add_argument("--semantic_cross_view_weight", type=float, default=0.06)
     parser.add_argument("--semantic_chunks_per_step", type=int, default=3)
     parser.add_argument("--importance_ema", type=float, default=0.90)
-    parser.add_argument("--rgb_tier_weights", nargs=3, type=float, default=(0.35, 1.0, 4.0))
-    parser.add_argument("--semantic_tier_weights", nargs=3, type=float, default=(0.15, 1.0, 4.0))
-    parser.add_argument("--tier_densify_multipliers", nargs=3, type=float, default=(1.80, 1.0, 0.55))
-    parser.add_argument("--tier_opacity_multipliers", nargs=3, type=float, default=(2.0, 1.0, 0.5))
+    parser.add_argument("--rgb_tier_weights", nargs=3, type=float, default=(0.30, 1.20, 5.0))
+    parser.add_argument("--semantic_tier_weights", nargs=3, type=float, default=(0.12, 1.25, 5.0))
+    parser.add_argument("--tier_densify_multipliers", nargs=3, type=float, default=(1.25, 0.72, 0.35))
+    parser.add_argument("--tier_opacity_multipliers", nargs=3, type=float, default=(1.25, 0.70, 0.25))
     parser.add_argument("--tier_sh_degrees", nargs=3, type=int, default=(1, 3, 5))
     parser.add_argument("--densify_from_iter", type=int, default=500)
-    parser.add_argument("--densify_until_iter", type=int, default=22000)
+    parser.add_argument("--densify_until_iter", type=int, default=11250)
     parser.add_argument("--densify_grad_threshold", type=float, default=0.0001)
     parser.add_argument("--sparse", action="store_true")
     parser.add_argument("--max_train_views", type=int, default=-1)
     parser.add_argument("--view_stride", type=int, default=1)
     parser.add_argument("--depths", default="", help="Depth directory name inside scene")
+    parser.add_argument(
+        "--validation_file", default="",
+        help="Optional camera-name list held out from training, relative to scene",
+    )
+    parser.add_argument("--validation_interval", type=int, default=1000)
+    parser.add_argument("--validation_start", type=int, default=5000)
+    parser.add_argument("--early_stop_patience", type=int, default=4)
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.02)
     parser.add_argument("--matcher", choices=["exhaustive", "sequential"], default="exhaustive")
     parser.add_argument("--no_colmap_gpu", action="store_true")
     parser.add_argument(
@@ -205,12 +239,21 @@ def main():
         args.spatial_k, args.spatial_samples, args.densify_from_iter,
         args.densify_until_iter, args.cross_view_prototypes,
         args.spatial_every, args.joint_spatial_samples,
-        args.semantic_chunks_per_step,
+        args.semantic_chunks_per_step, args.boundary_width,
     ) < 1:
         parser.error("Training counts, dimensions, and sampling values must be positive")
     if min(args.foreground_weight, args.background_weight, args.semantic_lr) <= 0:
         parser.error("RGB weights and semantic learning rate must be positive")
-    if args.spatial_weight < 0 or args.densify_grad_threshold <= 0:
+    if (
+        args.spatial_weight < 0 or args.densify_grad_threshold <= 0
+        or args.boundary_boost < 0 or args.thin_boost < 0
+        or args.thin_compactness <= 0 or args.thin_aspect_ratio <= 1
+        or args.semantic_edge_sigma <= 0
+        or args.semantic_cross_view_weight < 0
+        or args.validation_interval < 0 or args.validation_start < 0
+        or args.early_stop_patience < 0
+        or args.early_stop_min_delta < 0
+    ):
         parser.error("Spatial weight must be non-negative and densify threshold positive")
     if not 0 <= args.cross_view_weight <= 1 or not 0 <= args.importance_ema < 1:
         parser.error("Cross-view weight must be in [0, 1] and importance EMA in [0, 1)")

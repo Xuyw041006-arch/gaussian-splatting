@@ -62,6 +62,25 @@ def load_joint_map(path):
             if "importance" in data.files
             else valid.astype(np.uint8)
         )
+        detail_weight = (
+            data["detail_weight"].astype(np.float32)
+            if "detail_weight" in data.files
+            else np.ones(valid.shape, dtype=np.float32)
+        )
+        boundary = (
+            data["boundary"].astype(bool)
+            if "boundary" in data.files
+            else np.zeros(valid.shape, dtype=bool)
+        )
+        prototype_ids = (
+            data["prototype_ids"].astype(np.int64)
+            if "prototype_ids" in data.files
+            else np.full(valid.shape, -1, dtype=np.int64)
+        )
+        hierarchy_prototype_ids = (
+            data["hierarchy_prototype_ids"].astype(np.int64)
+            if "hierarchy_prototype_ids" in data.files else None
+        )
     return {
         "features": torch.from_numpy(features),
         "valid": torch.from_numpy(valid),
@@ -77,6 +96,13 @@ def load_joint_map(path):
             if hierarchy_confidence is not None else None
         ),
         "importance": torch.from_numpy(importance),
+        "detail_weight": torch.from_numpy(detail_weight),
+        "boundary": torch.from_numpy(boundary),
+        "prototype_ids": torch.from_numpy(prototype_ids),
+        "hierarchy_prototype_ids": (
+            torch.from_numpy(hierarchy_prototype_ids)
+            if hierarchy_prototype_ids is not None else None
+        ),
     }
 
 
@@ -99,8 +125,16 @@ def select_granularity(supervision, level):
             hierarchy_confidence[level]
             if hierarchy_confidence is not None else supervision["confidence"]
         )
-        return hierarchy[level], hierarchy_valid[level], confidence
-    return supervision["features"], supervision["valid"], supervision["confidence"]
+        prototypes = supervision["hierarchy_prototype_ids"]
+        prototype_ids = (
+            prototypes[level]
+            if prototypes is not None else supervision["prototype_ids"]
+        )
+        return hierarchy[level], hierarchy_valid[level], confidence, prototype_ids
+    return (
+        supervision["features"], supervision["valid"],
+        supervision["confidence"], supervision["prototype_ids"],
+    )
 
 
 def tier_weights(tiers, weights):
@@ -113,6 +147,10 @@ def tier_weights(tiers, weights):
 def project_tiers_to_gaussians(xyz, camera, tiers, visible_indices):
     """Project visible Gaussian centers and sample their current view's tier."""
     visible_indices = visible_indices.reshape(-1)
+    if visible_indices.dtype == torch.bool:
+        visible_indices = torch.nonzero(
+            visible_indices, as_tuple=False
+        ).reshape(-1)
     if visible_indices.numel() == 0:
         return visible_indices, torch.empty(0, device=xyz.device)
     points = xyz[visible_indices]
@@ -132,8 +170,8 @@ def project_tiers_to_gaussians(xyz, camera, tiers, visible_indices):
     return selected, observations
 
 
-def local_semantic_consistency(gaussians, samples=512):
-    """Dynamic geometry-aware smoothing that remains valid after densification."""
+def local_semantic_consistency(gaussians, samples=512, edge_sigma=0.20):
+    """Geometry-aware smoothing that avoids bleeding across semantic boundaries."""
     features = gaussians.get_semantic_features
     count = min(int(samples), features.shape[0])
     if count < 2:
@@ -154,4 +192,17 @@ def local_semantic_consistency(gaussians, samples=512):
     edge_weight = torch.exp(
         -neighbor_distance / spatial_scale.clamp_min(1e-7)
     )
+    # Detaching this affinity prevents the regularizer from winning by making
+    # unrelated object features artificially similar.
+    semantic_distance = torch.abs(
+        features[indices].detach() - features[neighbors].detach()
+    ).mean(dim=-1)
+    edge_weight *= torch.exp(
+        -semantic_distance / max(float(edge_sigma), 1e-6)
+    )
+    tier_agreement = 1.0 - torch.abs(
+        gaussians.importance_score[indices]
+        - gaussians.importance_score[neighbors]
+    ).detach()
+    edge_weight *= tier_agreement.clamp_min(0.1)
     return (error * edge_weight).sum() / edge_weight.sum().clamp_min(1e-7)

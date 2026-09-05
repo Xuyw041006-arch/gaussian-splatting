@@ -40,6 +40,7 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        self.val_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
@@ -48,6 +49,60 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
         else:
             assert False, "Could not recognize scene type!"
+
+        validation_cameras = []
+        validation_file = getattr(args, "validation_file", "")
+        if validation_file:
+            validation_path = validation_file
+            if not os.path.isabs(validation_path):
+                validation_path = os.path.join(args.source_path, validation_path)
+            if not os.path.isfile(validation_path):
+                if self.loaded_iter is not None:
+                    print(
+                        "Validation list is unavailable while loading a trained "
+                        f"model; continuing without it: {validation_path}"
+                    )
+                    validation_path = ""
+                else:
+                    raise FileNotFoundError(
+                        f"Validation camera list does not exist: {validation_path}"
+                    )
+            if validation_path:
+                with open(validation_path, encoding="utf-8") as handle:
+                    validation_names = {
+                        line.strip() for line in handle if line.strip()
+                    }
+            else:
+                validation_names = set()
+            if validation_names:
+                validation_cameras = [
+                    camera for camera in scene_info.train_cameras
+                    if camera.image_name in validation_names
+                ]
+                remaining_cameras = [
+                    camera for camera in scene_info.train_cameras
+                    if camera.image_name not in validation_names
+                ]
+                missing = validation_names.difference(
+                    camera.image_name for camera in validation_cameras
+                )
+                if missing:
+                    raise ValueError(
+                        "Validation list contains cameras absent from the training set: "
+                        + ", ".join(sorted(missing)[:5])
+                    )
+                if not validation_cameras or len(remaining_cameras) < 2:
+                    raise ValueError(
+                        "Validation split needs at least one held-out and two training cameras"
+                    )
+                print(
+                    f"Validation holdout: {len(validation_cameras)} cameras; "
+                    f"training on {len(remaining_cameras)} cameras"
+                )
+                scene_info = scene_info._replace(
+                    train_cameras=remaining_cameras,
+                    nerf_normalization=getNerfppNorm(remaining_cameras),
+                )
 
         selected_train_cameras = select_uniform(
             scene_info.train_cameras, args.max_train_views, args.view_stride
@@ -71,6 +126,8 @@ class Scene:
             camlist = []
             if scene_info.test_cameras:
                 camlist.extend(scene_info.test_cameras)
+            if validation_cameras:
+                camlist.extend(validation_cameras)
             if scene_info.train_cameras:
                 camlist.extend(scene_info.train_cameras)
             for id, cam in enumerate(camlist):
@@ -81,6 +138,7 @@ class Scene:
         if shuffle:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+            random.shuffle(validation_cameras)
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
@@ -89,6 +147,8 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
+            print("Loading Validation Cameras")
+            self.val_cameras[resolution_scale] = cameraList_from_camInfos(validation_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -114,3 +174,6 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def getValCameras(self, scale=1.0):
+        return self.val_cameras[scale]
