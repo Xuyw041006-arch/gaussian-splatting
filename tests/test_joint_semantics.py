@@ -3,6 +3,8 @@ import unittest
 import numpy as np
 
 try:
+    import torch
+
     from preprocess_semantics import (
         aggregate_cross_view_features,
         build_detail_supervision,
