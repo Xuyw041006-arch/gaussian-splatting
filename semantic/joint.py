@@ -197,12 +197,12 @@ def local_semantic_consistency(gaussians, samples=512, edge_sigma=0.20):
     semantic_distance = torch.abs(
         features[indices].detach() - features[neighbors].detach()
     ).mean(dim=-1)
-    edge_weight *= torch.exp(
+    edge_weight = edge_weight * torch.exp(
         -semantic_distance / max(float(edge_sigma), 1e-6)
     )
     tier_agreement = 1.0 - torch.abs(
         gaussians.importance_score[indices]
         - gaussians.importance_score[neighbors]
     ).detach()
-    edge_weight *= tier_agreement.clamp_min(0.1)
+    edge_weight = edge_weight * tier_agreement.clamp_min(0.1)
     return (error * edge_weight).sum() / edge_weight.sum().clamp_min(1e-7)

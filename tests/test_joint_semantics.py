@@ -11,7 +11,8 @@ try:
         build_hierarchy_region_maps,
     )
     from semantic.joint import (
-        GRANULARITIES, granularity_for_step, project_tiers_to_gaussians,
+        GRANULARITIES, granularity_for_step, local_semantic_consistency,
+        project_tiers_to_gaussians,
     )
     DEPENDENCIES_AVAILABLE = True
 except ModuleNotFoundError:
@@ -91,6 +92,30 @@ class JointSemanticTests(unittest.TestCase):
         )
         self.assertEqual(selected.tolist(), [0, 2])
         self.assertEqual(observations.tolist(), [0.5, 0.5])
+
+    def test_local_semantic_consistency_supports_backward(self):
+        class Gaussians:
+            def __init__(self):
+                self._features = torch.nn.Parameter(torch.randn(8, 4))
+                self._xyz = torch.nn.Parameter(torch.randn(8, 3))
+                self.importance_score = torch.linspace(0.0, 1.0, 8)
+
+            @property
+            def get_semantic_features(self):
+                return self._features
+
+            @property
+            def get_xyz(self):
+                return self._xyz
+
+        gaussians = Gaussians()
+        loss = local_semantic_consistency(
+            gaussians, samples=8, edge_sigma=0.12
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(gaussians._features.grad)
+        self.assertIsNotNone(gaussians._xyz.grad)
 
 
 if __name__ == "__main__":
