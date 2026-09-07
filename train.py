@@ -47,6 +47,22 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+
+def load_training_checkpoint(path):
+    """Load checkpoints produced by this trainer across PyTorch releases.
+
+    PyTorch 2.6 changed ``torch.load`` to default to ``weights_only=True``.
+    Our checkpoints also contain optimizer and joint-semantic Python state, so
+    they must use the legacy loader. Only pass checkpoints from a trusted run.
+    """
+    try:
+        return torch.load(path, weights_only=False)
+    except TypeError as error:
+        # Compatibility with older PyTorch versions that predate weights_only.
+        if "weights_only" not in str(error):
+            raise
+        return torch.load(path)
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations,
              checkpoint, debug_from, importance_mask_dir="", foreground_weight=4.0,
              background_weight=0.25, joint_args=None):
@@ -61,7 +77,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.training_setup(opt)
     checkpoint_joint_state = None
     if checkpoint:
-        loaded_checkpoint = torch.load(checkpoint)
+        loaded_checkpoint = load_training_checkpoint(checkpoint)
         if len(loaded_checkpoint) >= 3:
             model_params, first_iter, checkpoint_joint_state = loaded_checkpoint[:3]
         else:
@@ -388,7 +404,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         and best_val_iteration > 0
         and os.path.isfile(best_validation_checkpoint)
     ):
-        best_model, _, best_joint_state = torch.load(best_validation_checkpoint)
+        best_model, _, best_joint_state = load_training_checkpoint(
+            best_validation_checkpoint
+        )
         gaussians.restore(best_model, opt)
         if joint is not None:
             joint.restore_checkpoint_state(best_joint_state)

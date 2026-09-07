@@ -1,9 +1,11 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.run_ramen_benchmark import (
+    estimate_completed_training_seconds,
     latest_checkpoint,
     select_validation_views,
     semantic_training_complete,
@@ -12,6 +14,22 @@ from scripts.run_ramen_benchmark import (
 
 
 class RamenResumeTests(unittest.TestCase):
+    def test_completed_training_time_can_be_recovered_from_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            start = root / "cfg_args"
+            end = (
+                root / "point_cloud" / "iteration_15000" / "point_cloud.ply"
+            )
+            end.parent.mkdir(parents=True)
+            start.touch()
+            end.touch()
+            os.utime(start, (1000, 1000))
+            os.utime(end, (1123.5, 1123.5))
+            self.assertEqual(
+                estimate_completed_training_seconds(root, 15000), 123.5
+            )
+
     def test_latest_checkpoint_ignores_final_and_malformed_names(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

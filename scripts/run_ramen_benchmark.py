@@ -46,6 +46,29 @@ def save_json(path, payload):
     temporary.replace(path)
 
 
+def estimate_completed_training_seconds(model, iteration):
+    """Recover elapsed time when a completed subprocess failed after saving.
+
+    The benchmark records wall time only after ``train.py`` exits cleanly.  If
+    post-training selection fails, the saved artifacts still provide a useful
+    start/end interval so ``--resume`` can preserve the equal-time protocol.
+    """
+    model = Path(model)
+    starts = [model / "cfg_args", model / "cameras.json"]
+    ends = [
+        model / "point_cloud" / f"iteration_{iteration}" / "point_cloud.ply",
+        model / "semantic" / f"iteration_{iteration}" / "semantic_features.pt",
+    ]
+    starts = [path for path in starts if path.is_file()]
+    ends = [path for path in ends if path.is_file()]
+    if not starts or not ends:
+        return None
+    elapsed = max(path.stat().st_mtime for path in ends) - min(
+        path.stat().st_mtime for path in starts
+    )
+    return float(elapsed) if elapsed > 0 else None
+
+
 def latest_checkpoint(model, maximum):
     candidates = []
     for path in Path(model).glob("chkpnt*.pth"):
@@ -268,6 +291,25 @@ def main():
                 run_stage("joint_train_seconds", command)
             else:
                 print("Reusing completed joint model", flush=True)
+                if "joint_train_seconds" not in timings:
+                    recovered = estimate_completed_training_seconds(
+                        joint, args.iterations
+                    )
+                    if recovered is None:
+                        if args.equal_time:
+                            raise RuntimeError(
+                                "Cannot recover joint wall time for the equal-time "
+                                "baseline. Re-run the joint stage or provide "
+                                "training_times.json."
+                            )
+                    else:
+                        timings["joint_train_seconds"] = recovered
+                        timings["joint_train_seconds_recovered"] = True
+                        save_json(timing_path, timings)
+                        print(
+                            f"Recovered joint wall time: {recovered:.3f}s",
+                            flush=True,
+                        )
 
         if not args.skip_baseline:
             baseline_ply = (
