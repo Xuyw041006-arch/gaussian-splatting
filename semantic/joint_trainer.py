@@ -7,14 +7,18 @@ import numpy as np
 import torch
 
 from gaussian_renderer import render
+from semantic.curriculum import cosine_ramp, curriculum_phase
 from semantic.joint import (
     ScaleGate,
+    boundary_alignment_loss,
     granularity_for_step,
     load_importance_tiers,
     load_joint_map,
     local_semantic_consistency,
     project_tiers_to_gaussians,
+    region_contrastive_loss,
     select_granularity,
+    select_region_ids,
     tier_weights,
 )
 
@@ -87,6 +91,12 @@ class JointSemanticSupervisor:
         tiers = supervision["importance"].cuda(non_blocking=True)
         detail_weight = supervision["detail_weight"].cuda(non_blocking=True)
         prototype_ids = prototype_ids.cuda(non_blocking=True)
+        region_ids = select_region_ids(supervision, level).cuda(non_blocking=True)
+        boundary = supervision["boundary"].cuda(non_blocking=True)
+        curriculum_weight = cosine_ramp(
+            iteration, self.args.semantic_start,
+            self.args.semantic_ramp_iterations,
+        )
 
         height, width = target.shape[-2:]
         original_size = (camera.image_height, camera.image_width)
@@ -112,6 +122,8 @@ class JointSemanticSupervisor:
             )
             chunk_losses = []
             cross_view_losses = []
+            boundary_losses = []
+            contrastive_losses = []
             packages = []
             first_chunk = (iteration * self.args.semantic_chunks_per_step) % chunks
             for offset in range(min(self.args.semantic_chunks_per_step, chunks)):
@@ -131,6 +143,14 @@ class JointSemanticSupervisor:
                     (error[active] * weights[active]).sum()
                     / weights[active].sum().clamp_min(1e-8)
                 )
+                boundary_losses.append(boundary_alignment_loss(
+                    prediction, target[start:stop], boundary, active, weights
+                ))
+                if iteration % self.args.semantic_contrastive_every == 0:
+                    contrastive_losses.append(region_contrastive_loss(
+                        prediction, region_ids, active,
+                        self.args.semantic_contrastive_samples, weights,
+                    ))
                 if self.prototype_features is not None:
                     prototype_valid = active & (prototype_ids >= 0)
                     if prototype_valid.any():
@@ -151,6 +171,11 @@ class JointSemanticSupervisor:
                 torch.stack(cross_view_losses).mean()
                 if cross_view_losses else prediction.new_zeros(())
             )
+            boundary_loss = torch.stack(boundary_losses).mean()
+            contrastive_loss = (
+                torch.stack(contrastive_losses).mean()
+                if contrastive_losses else prediction.new_zeros(())
+            )
 
             spatial_loss = prediction.new_zeros(())
             if iteration % self.args.semantic_spatial_every == 0:
@@ -158,17 +183,27 @@ class JointSemanticSupervisor:
                     self.gaussians, self.args.semantic_spatial_samples,
                     self.args.semantic_edge_sigma,
                 )
-            loss = (
+            raw_loss = (
                 self.args.semantic_weight * data_loss
                 + self.args.semantic_cross_view_weight * cross_view_loss
+                + self.args.semantic_boundary_weight * boundary_loss
+                + self.args.semantic_contrastive_weight * contrastive_loss
                 + self.args.semantic_spatial_weight
                 * self.args.semantic_spatial_every * spatial_loss
             )
+            loss = float(curriculum_weight) * raw_loss
             return {
                 "loss": loss,
                 "data_loss": data_loss.detach(),
                 "spatial_loss": spatial_loss.detach(),
                 "cross_view_loss": cross_view_loss.detach(),
+                "boundary_loss": boundary_loss.detach(),
+                "contrastive_loss": contrastive_loss.detach(),
+                "curriculum_weight": float(curriculum_weight),
+                "phase": curriculum_phase(
+                    iteration, self.args.semantic_start,
+                    self.args.semantic_ramp_iterations,
+                ),
                 "packages": packages,
                 "level": level,
                 "chunks": [
@@ -228,6 +263,12 @@ class JointSemanticSupervisor:
                 self.args.semantic_cross_view_weight
             ),
             "semantic_edge_sigma": float(self.args.semantic_edge_sigma),
+            "semantic_start": int(self.args.semantic_start),
+            "semantic_ramp_iterations": int(self.args.semantic_ramp_iterations),
+            "semantic_boundary_weight": float(self.args.semantic_boundary_weight),
+            "semantic_contrastive_weight": float(
+                self.args.semantic_contrastive_weight
+            ),
         }
         torch.save(artifact, output)
         return output

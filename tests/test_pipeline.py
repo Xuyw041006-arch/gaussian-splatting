@@ -24,9 +24,12 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("--rgb_tier_weights", rgb)
         self.assertEqual(rgb[rgb.index("--sh_degree") + 1], "5")
         self.assertIn("--random_background", rgb)
-        self.assertEqual(rgb[rgb.index("--densify_until_iter") + 1], "75")
+        self.assertEqual(rgb[rgb.index("--densify_until_iter") + 1], "80")
         self.assertIn("ViT-H-14", steps[1].command)
         self.assertIn("--cross_view_prototypes", steps[1].command)
+        self.assertIn("--semantic_ramp_iterations", rgb)
+        self.assertIn("--semantic_boundary_weight", rgb)
+        self.assertIn("--semantic_contrastive_weight", rgb)
 
     def test_sequential_mode_remains_available_as_baseline(self):
         args = make_parser().parse_args([
@@ -41,6 +44,16 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(
             any(value.endswith("train_semantics.py") for value in steps[3].command)
         )
+
+    def test_rgb_only_skips_all_semantic_work(self):
+        args = make_parser().parse_args([
+            "--scene", "/tmp/example-scene", "--model", "/tmp/example-model",
+            "--training_mode", "off", "--preset", "quick",
+        ])
+        steps = build_steps(args)
+        self.assertEqual([step.name for step in steps], ["colmap", "rgb"])
+        self.assertNotIn("--joint_semantics", steps[-1].command)
+        self.assertEqual(steps[-1].command[steps[-1].command.index("--iterations") + 1], "7000")
 
 
 if __name__ == "__main__":

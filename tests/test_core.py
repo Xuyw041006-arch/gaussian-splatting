@@ -12,6 +12,9 @@ from semantic.artifact import (
 )
 from semantic.inspection import pick_point, project_points
 from utils.view_selection import select_uniform
+from semantic.curriculum import cosine_ramp, curriculum_phase
+from semantic.inventory import parse_inventory_config, rank_scene_inventory
+from semantic.presets import estimate_minutes, preset
 
 
 class ArtifactTests(unittest.TestCase):
@@ -48,6 +51,41 @@ class SparseViewTests(unittest.TestCase):
 
     def test_stride(self):
         self.assertEqual(select_uniform(list(range(8)), stride=3), [0, 3, 6])
+
+
+class CurriculumAndInventoryTests(unittest.TestCase):
+    def test_semantic_curriculum_is_rgb_then_smooth_then_joint(self):
+        self.assertEqual(cosine_ramp(999, 1000, 2000), 0.0)
+        self.assertAlmostEqual(cosine_ramp(2000, 1000, 2000), 0.5)
+        self.assertEqual(cosine_ramp(3000, 1000, 2000), 1.0)
+        self.assertEqual(curriculum_phase(500, 1000, 2000), "rgb_warmup")
+        self.assertEqual(curriculum_phase(1500, 1000, 2000), "semantic_ramp")
+
+    def test_user_or_llm_config_maps_three_tiers(self):
+        tiers = parse_inventory_config({"objects": [
+            {"label": "apple", "tier": "important", "aliases": ["fruit"]},
+            {"label": "cup", "tier": "normal"},
+            {"label": "wall", "tier": "background"},
+        ]})
+        self.assertEqual(tiers["important"], ["apple", "fruit"])
+        self.assertEqual(tiers["background"], ["wall"])
+
+    def test_clip_inventory_requires_cross_view_evidence(self):
+        regions = np.array([[1, 0], [0.9, 0.1], [0, 1]], dtype=np.float32)
+        regions /= np.linalg.norm(regions, axis=1, keepdims=True)
+        candidates = np.eye(2, dtype=np.float32)
+        result = rank_scene_inventory(
+            regions, candidates, ["apple", "wall"], ["a", "b", "a"],
+            [0.1, 0.2, 0.8], threshold=0.5, topk_per_region=1,
+        )
+        self.assertEqual(result[0]["label"], "apple")
+        self.assertEqual(result[0]["view_count"], 2)
+
+    def test_presets_trade_runtime_for_capacity(self):
+        self.assertLess(preset("quick")["scene_iterations"], preset("quality")["scene_iterations"])
+        quick = estimate_minutes("quick", 30, semantics=False)
+        quality = estimate_minutes("quality", 30, semantics=True)
+        self.assertLess(quick[1], quality[0])
 
 
 class InspectionTests(unittest.TestCase):

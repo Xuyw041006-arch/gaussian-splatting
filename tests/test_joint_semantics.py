@@ -1,4 +1,5 @@
 import unittest
+import importlib.util
 
 import numpy as np
 
@@ -11,8 +12,9 @@ try:
         build_hierarchy_region_maps,
     )
     from semantic.joint import (
-        GRANULARITIES, granularity_for_step, local_semantic_consistency,
-        project_tiers_to_gaussians,
+        GRANULARITIES, boundary_alignment_loss, granularity_for_step,
+        local_semantic_consistency, project_tiers_to_gaussians,
+        region_contrastive_loss,
     )
     DEPENDENCIES_AVAILABLE = True
 except ModuleNotFoundError:
@@ -35,6 +37,7 @@ class JointSemanticTests(unittest.TestCase):
         self.assertTrue(np.any(maps[1] == 1))
         self.assertTrue(np.any(maps[2] == 2))
 
+    @unittest.skipUnless(importlib.util.find_spec("sklearn"), "scikit-learn is optional locally")
     def test_cross_view_prototypes_pull_related_descriptors_together(self):
         features = np.array([
             [1.0, 0.0], [0.8, 0.2], [-1.0, 0.0], [-0.8, 0.2],
@@ -49,6 +52,7 @@ class JointSemanticTests(unittest.TestCase):
         output_similarity = np.dot(output[0], output[1])
         self.assertGreater(output_similarity, original_similarity)
 
+    @unittest.skipUnless(importlib.util.find_spec("sklearn"), "scikit-learn is optional locally")
     def test_cross_view_prototypes_can_return_global_centers(self):
         features = np.array([
             [1.0, 0.0], [0.9, 0.1], [-1.0, 0.0], [-0.9, 0.1],
@@ -116,6 +120,27 @@ class JointSemanticTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(gaussians._features.grad)
         self.assertIsNotNone(gaussians._xyz.grad)
+
+    def test_boundary_alignment_prefers_matching_edges(self):
+        target = torch.zeros((3, 5, 6))
+        target[:, :, 3:] = 1.0
+        boundary = torch.zeros((5, 6), dtype=torch.bool)
+        boundary[:, 2:4] = True
+        valid = torch.ones((5, 6), dtype=torch.bool)
+        matching = boundary_alignment_loss(target.clone(), target, boundary, valid)
+        flat = boundary_alignment_loss(torch.zeros_like(target), target, boundary, valid)
+        self.assertLess(float(matching), float(flat))
+
+    def test_region_contrastive_loss_supports_backward(self):
+        prediction = torch.randn(3, 6, 6, requires_grad=True)
+        ids = torch.zeros((6, 6), dtype=torch.long)
+        ids[:, 3:] = 1
+        loss = region_contrastive_loss(
+            prediction, ids, torch.ones_like(ids, dtype=torch.bool), samples=24
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(prediction.grad)
 
 
 if __name__ == "__main__":

@@ -133,6 +133,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=15000)
     parser.add_argument("--semantic_iterations", type=int, default=5000)
     parser.add_argument("--semantic_start", type=int, default=1000)
+    parser.add_argument("--semantic_ramp_iterations", type=int, default=2500)
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--feature_width", type=int, default=512)
     parser.add_argument("--validation_views", type=int, default=12)
@@ -162,8 +163,8 @@ def main():
         parser.error("iteration and feature values must be positive")
     if args.early_stop_patience < 0:
         parser.error("early-stop patience must be non-negative")
-    if not 0 <= args.semantic_start < args.iterations:
-        parser.error("semantic start must be in [0, iterations)")
+    if not 0 <= args.semantic_start < args.iterations or args.semantic_ramp_iterations < 0:
+        parser.error("semantic start/ramp must fit a non-negative curriculum")
     repo = Path(__file__).resolve().parents[1]
     scene = Path(args.scene).resolve()
     output_root = Path(args.output_root).resolve()
@@ -271,6 +272,7 @@ def main():
                     *common_train,
                     "--joint_semantics", "--semantic_dir", scene / "semantic_maps",
                     "--sh_degree", 5, "--semantic_start", args.semantic_start,
+                    "--semantic_ramp_iterations", args.semantic_ramp_iterations,
                     "--semantic_weight", 0.22, "--semantic_lr", 0.01,
                     "--scale_gate_lr", 0.001,
                     "--rgb_tier_weights", 0.30, 1.20, 5.0,
@@ -282,7 +284,11 @@ def main():
                     "--semantic_spatial_every", 8,
                     "--semantic_spatial_samples", 768,
                     "--semantic_edge_sigma", 0.12,
-                    "--semantic_cross_view_weight", 0.06,
+                    "--semantic_cross_view_weight", 0.08,
+                    "--semantic_boundary_weight", 0.08,
+                    "--semantic_contrastive_weight", 0.05,
+                    "--semantic_contrastive_samples", 320,
+                    "--semantic_contrastive_every", 4,
                     "--semantic_chunks_per_step", 3,
                 ]
                 checkpoint = latest_checkpoint(joint, args.iterations)

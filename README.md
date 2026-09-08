@@ -10,11 +10,13 @@
 ## 已实现的闭环
 
 1. **自建数据**：普通照片复制到标准目录，COLMAP 自动计算相机与稀疏点云。
-2. **重要物体优先**：用户或 LLM 给出 `apple,cup` 等重要词；SAM+CLIP 生成重要、普通、背景三级监督，联合训练提高重点区域的 RGB/语义损失和高斯密度。
-3. **开放词汇语义**：SAM 区域按 predicted-IoU × stability 加权，ViT-H/14 CLIP 特征经 PCA 压缩后与 RGB 同时反向传播；alpha 归一化、场景原型和动态 3D 邻域损失共同抑制跨视图漂移。
-4. **少图模式**：可均匀限制训练视角，并复用官方主分支的单目深度正则化；对视频帧支持 sequential COLMAP matcher。
-5. **搜索和编辑**：文本查询返回全部匹配高斯、数量、中心和包围盒；可导出命中点云，或生成删除/仅保留目标的新模型。
-6. **网页交互**：[Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 可直接导入训练结果，在浏览器中拖动旋转、滚轮缩放、点击拾取、文本定位并可恢复地隐藏语义物体。
+2. **先重建、再渐进语义**：前段为真正的纯 RGB warm-up；随后按余弦曲线逐步开启语义、三级重要性、分档 SH 和差异化分裂，避免早期噪声掩码破坏几何。
+3. **先发现、后定重要性**：可选 RAM++ 先提出场景词汇，SAM 区域 + CLIP 再做跨视角验证并生成 `scene_inventory.json`；用户或任意 LLM 最后将物品分为高重要性、普通和背景。修改分档无需重跑 SAM。
+4. **开放词汇语义**：除多粒度门控、LaGa 式场景原型外，新增 SAGA 式区域对比损失和显式边界对齐损失，边界与细长物体同时获得更高语义和高斯预算。
+5. **稀疏/单图模式**：2–12 张自动进入稀疏模式，并可接 Depth Anything V2 深度先验；单张图片通过 LucidDreamer 进入“生成补全”，结果明确标注为非测量级几何。
+6. **三种产品预设**：快速 7K / 16D、均衡 15K / 32D、精度 22K / 48D；每种都能选择纯 RGB 或语义联合。
+7. **搜索和编辑**：文本查询返回全部匹配高斯、数量、中心和包围盒；可导出命中点云，或生成删除/仅保留目标的新模型。
+8. **App 交互**：[Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 可安装到 Mac 程序坞/桌面，配置训练、估算时间、拖动查看、点击拾取、文本定位并可恢复地隐藏语义物体。
 
 ## 目录
 
@@ -31,6 +33,12 @@ export_web_bundle.py          导出 Gaussian Atlas 的 PLY + 语义索引
 scripts/prepare_dataset.py    自建图片目录导入
 scripts/prune_gaussians.py    尺度/透明度/空间离群高斯清理
 scripts/run_pipeline.py       完整流水线与 dry-run
+scripts/run_from_config.py    读取 Gaussian Atlas App 下载的训练配置
+scripts/discover_scene_tags.py RAM++ 场景词汇提议
+scripts/relabel_semantics.py   不重跑 SAM，应用用户/LLM 三级权重
+scripts/generate_depth_priors.py Depth Anything V2 稀疏视角深度先验
+scripts/run_single_image.py    LucidDreamer 单图生成补全适配器
+scripts/tune_semantic_warmup.py 验证集自动选择 RGB warm-up
 scripts/run_ramen_benchmark.py Ramen 顺序基线/联合模型 A/B 测试
 scripts/evaluate_lerf_mask.py  PSNR/SSIM/mIoU/Boundary-IoU
 scripts/preflight.py          环境/数据/检查点诊断
@@ -51,6 +59,12 @@ pip install -r requirements-semantic.txt
 pip install -r requirements-ui.txt
 ```
 
+若要启用自动场景词汇提议，再安装可选 RAM++：
+
+```bash
+pip install -r requirements-discovery.txt
+```
+
 下载与 `--sam_model` 一致的 Segment Anything 检查点。快速测试可用 `sam_vit_b_01ec64.pth`；高质量模式使用 `sam_vit_h_4b8939.pth`。
 
 ## 2. 自建数据
@@ -65,7 +79,109 @@ python scripts/prepare_dataset.py \
 
 视频抽帧请先用 ffmpeg，再把抽帧目录传给上面的命令。顺序视频帧在流水线中使用 `--matcher sequential`。
 
-## 3. 先检查，不训练
+## 3. 三档重建与 RGB/语义开关
+
+均衡 15K 联合模型（推荐）：
+
+```bash
+python scripts/run_pipeline.py \
+  --scene /data/my_scene --model output/my_scene \
+  --sam_checkpoint /checkpoints/sam_vit_h_4b8939.pth \
+  --preset balanced --training_mode joint --resume
+```
+
+快速纯 RGB：
+
+```bash
+python scripts/run_pipeline.py \
+  --scene /data/my_scene --model output/my_scene_rgb \
+  --preset quick --training_mode off --resume
+```
+
+`--preset quality` 使用 22K、48D 语义和更长的分裂窗口，但仍保留验证集早停，
+不会盲目跑 30K。`--dry_run` 可先打印全部真实命令。
+
+## 4. 先发现物品，再由用户或 LLM 分档
+
+完整自动提议需要 RAM++ 检查点；它只负责提出词汇，最终仍由 SAM 区域与 CLIP
+验证，避免把图像标签直接当成 3D 物体：
+
+```bash
+python scripts/run_pipeline.py \
+  --scene /data/my_scene --model output/discovery \
+  --sam_checkpoint /checkpoints/sam_vit_h_4b8939.pth \
+  --ram_checkpoint /checkpoints/ram_plus_swin_large_14m.pth \
+  --preset balanced --stages tag_discovery,semantics
+```
+
+编辑 `/data/my_scene/scene_inventory.json`，给每个对象填写 `tier`：
+
+```json
+{"objects": [
+  {"label": "apple", "tier": "important"},
+  {"label": "cup", "tier": "normal"},
+  {"label": "wall", "tier": "background"}
+]}
+```
+
+然后只重算重要性图，不再运行 SAM：
+
+```bash
+python scripts/relabel_semantics.py \
+  --scene /data/my_scene --config importance.json
+```
+
+`importance.json` 可以由 Gaussian Atlas App 下载，也可以由任意 LLM 按相同 schema
+生成。若要让验证集自动在 6% / 10% / 16% 三个 warm-up 比例中选择：
+
+```bash
+python scripts/tune_semantic_warmup.py \
+  --scene /data/my_scene \
+  --sam_checkpoint /checkpoints/sam_vit_h_4b8939.pth \
+  --validation_file /data/my_scene/sparse/0/val.txt \
+  --output_root output/warmup_search --run_final
+```
+
+App 下载的完整配置可直接在 Colab 中启动：
+
+```bash
+python scripts/run_from_config.py \
+  --config gaussian-atlas-config.json \
+  --scene /content/data/my_scene --model /content/output/my_scene \
+  --sam_checkpoint /content/checkpoints/sam_vit_h_4b8939.pth --resume
+```
+
+## 5. 稀疏视角与单图极限补全
+
+2–12 张会自动启用稀疏参数。建议先生成 Depth Anything V2 先验，再由 COLMAP
+稀疏点对齐尺度：
+
+```bash
+python scripts/generate_depth_priors.py --scene /data/my_scene
+python utils/make_depth_scale.py \
+  --base_dir /data/my_scene --depths_dir /data/my_scene/depths
+python scripts/run_pipeline.py \
+  --scene /data/my_scene --model output/my_sparse_scene \
+  --sam_checkpoint /checkpoints/sam_vit_h_4b8939.pth \
+  --capture_mode sparse --depths depths --preset balanced --resume
+```
+
+单张图片没有真实跨视角约束，因此单独调用官方 LucidDreamer 适配器，并强制使用
+`--training_mode off`：
+
+```bash
+python scripts/run_pipeline.py \
+  --scene /data --model output/single_completion \
+  --capture_mode single --training_mode off \
+  --single_image /data/input.jpg \
+  --single_backend_repo /content/LucidDreamer \
+  --single_prompt "a coherent indoor dining scene"
+```
+
+输出的 `single_completion.json` 会保留生成模型、随机种子和“不确定补全”声明。
+这条路径适合视觉补全，不适合尺寸测量或安全关键用途。
+
+## 6. 环境检查与 Colab
 
 ```bash
 python scripts/preflight.py \
@@ -81,11 +197,9 @@ python scripts/run_pipeline.py \
   --dry_run
 ```
 
-`--dry_run` 只打印四个真实命令，不生成模型。
-
-## 4. L4/T4 多视角高质量训练与冒烟模式
-
-没有本地 NVIDIA GPU 时，可直接打开上方 Colab Notebook，选择 **L4 GPU（推荐）** 或成本更低的 T4。默认使用 NeRF Synthetic Lego 的 80 个训练视角、10 个验证视角、512 像素分辨率和 10 万初始化点，执行 40,000 次 RGB 与 8,000 次语义训练。RGB 阶段保留上游 3DGS 的梯度累计、clone/split 和 opacity pruning，把分裂延长到 22,000 轮；语义阶段使用 SAM ViT-H、OpenCLIP ViT-H/14、24 维场景特征、alpha 归一化和颜色感知 3D KNN 正则。Notebook 会备份原始 PLY，高细节清理预设预计保留约 17 万高斯，而不是此前约 6.8 万的体积优先版本。最后生成可导入 [Gaussian Atlas](https://gaussian-atlas-xyw.xuyw041006.chatgpt.site) 的网页包。Lego 阈值只适用于该演示场景；自建数据应根据尺度重新调节。
+`--dry_run` 只打印命令，不生成模型。没有本地 NVIDIA GPU 时，可直接打开上方
+Colab Notebook，L4 为推荐档，T4 为省成本档。Ramen Notebook 仍采用 15K 与
+等墙钟时间基线；拉取最新仓库后会自动使用新的 warm-up、边界和区域对比损失。
 
 若只想先验证环境，可在命令行使用下面的小迭代冒烟模式；它只验证 COLMAP、官方 3DGS rasterizer、语义预处理和语义蒸馏能够完整走通，不代表重建质量：
 
@@ -108,43 +222,18 @@ output/my_scene_smoke/point_cloud/iteration_100/point_cloud.ply
 output/my_scene_smoke/semantic/iteration_100/semantic_features.pt
 ```
 
-正式训练去掉两个小迭代参数，默认 RGB 40,000 次、语义 8,000 次：
+正式训练直接使用预设：
 
 ```bash
 python scripts/run_pipeline.py \
   --scene /data/my_scene \
   --model output/my_scene \
   --sam_checkpoint /checkpoints/sam_vit_b_01ec64.pth \
-  --important "apple,cup" \
-  --sparse --max_train_views 8 \
+  --preset balanced --capture_mode sparse --max_train_views 8 \
   --resume
 ```
 
-### 单目深度增强少图重建
-
-官方主分支已原生支持 Depth Anything V2 深度正则。按下方上游说明生成 `depths/` 和 `sparse/0/depth_params.json` 后，在流水线增加：
-
-```bash
---depths depths
-```
-
-这会真正把深度损失加入训练，而不是仅修改“稀疏”参数名称。
-
-### 接入 LLM 的逐图重点物体
-
-让任意 LLM 输出一个 JSON 文件即可，不绑定某个云端模型：
-
-```json
-{
-  "IMG_0012.jpg": ["apple", "red cup"],
-  "IMG_0013.jpg": ["apple"],
-  "IMG_0014": ["fruit bowl", "table"]
-}
-```
-
-然后把 `--important "apple,cup"` 换为 `--important_json important_objects.json`。脚本会为每张图分别生成重要区域；JSON 没覆盖的图片使用 `--important` 的全局词表（如同时提供）。
-
-## 5. 搜索、删除与点击
+## 7. 搜索、删除与点击
 
 找到场景内所有苹果，并导出命中点云：
 

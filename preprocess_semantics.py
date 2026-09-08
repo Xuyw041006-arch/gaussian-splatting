@@ -10,6 +10,12 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
+from semantic.inventory import (
+    normalize_label,
+    parse_inventory_config,
+    rank_scene_inventory,
+)
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -226,6 +232,17 @@ def parse_prompts(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def load_inventory_candidates(repo, inline="", path=""):
+    candidate_path = Path(path) if path else repo / "assets" / "scene_vocabulary.txt"
+    labels = parse_prompts(inline)
+    if candidate_path.is_file():
+        labels.extend(
+            line.strip() for line in candidate_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return sorted({normalize_label(label) for label in labels if normalize_label(label)})
+
+
 def main():
     parser = ArgumentParser(description="Prepare semantic supervision for 3DGS")
     parser.add_argument("--scene", required=True, help="COLMAP scene root containing images/")
@@ -253,6 +270,10 @@ def main():
         "--important_json", default="",
         help="Optional JSON mapping image filename/stem to an LLM-produced list of important objects",
     )
+    parser.add_argument(
+        "--importance_config", default="",
+        help="User/LLM scene inventory JSON with background/normal/important tiers",
+    )
     parser.add_argument("--normal", default="", help="Normal-priority object prompts")
     parser.add_argument(
         "--normal_json", default="",
@@ -270,6 +291,16 @@ def main():
     parser.add_argument("--thin_boost", type=float, default=1.50)
     parser.add_argument("--thin_compactness", type=float, default=0.40)
     parser.add_argument("--thin_aspect_ratio", type=float, default=2.5)
+    parser.add_argument(
+        "--inventory_candidates", default="",
+        help="Extra comma-separated object words for SAM-region CLIP discovery",
+    )
+    parser.add_argument(
+        "--inventory_candidates_file", default="",
+        help="Optional newline-delimited object vocabulary; defaults to assets/scene_vocabulary.txt",
+    )
+    parser.add_argument("--inventory_threshold", type=float, default=0.22)
+    parser.add_argument("--inventory_topk_per_region", type=int, default=2)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -339,6 +370,17 @@ def main():
 
     prompts = parse_prompts(args.important)
     normal_prompts = parse_prompts(args.normal)
+    background_prompts = []
+    selected_inventory_tiers = {}
+    if args.importance_config:
+        with open(args.importance_config, encoding="utf-8") as handle:
+            tier_config = parse_inventory_config(json.load(handle))
+        prompts = sorted(set(prompts + tier_config["important"]))
+        normal_prompts = sorted(set(normal_prompts + tier_config["normal"]))
+        background_prompts = tier_config["background"]
+        selected_inventory_tiers = {
+            label: tier for tier, labels in tier_config.items() for label in labels
+        }
     prompt_map = {}
     normal_prompt_map = {}
     if args.important_json:
@@ -405,6 +447,10 @@ def main():
             hierarchy_region_maps=hierarchy_region_maps,
             features=features.astype(np.float16),
             confidences=confidences.astype(np.float16),
+            area_ratios=np.asarray(
+                [region["area"] / (rgb.shape[0] * rgb.shape[1]) for region in regions],
+                dtype=np.float32,
+            ),
         )
         all_features.append(features)
         normal_mapping = normal_prompt_map if normal_prompt_map else prompt_map
@@ -421,9 +467,41 @@ def main():
             "normal_prompts": prompts_for(
                 normal_mapping, path, normal_prompts, "normal"
             ),
+            "background_prompts": background_prompts,
         })
 
     stacked_raw = np.concatenate(all_features, axis=0)
+    repo = Path(__file__).resolve().parent
+    candidate_labels = load_inventory_candidates(
+        repo, args.inventory_candidates, args.inventory_candidates_file
+    )
+    candidate_labels = sorted(set(
+        candidate_labels + prompts + normal_prompts + background_prompts
+    ))
+    inventory = []
+    if candidate_labels:
+        candidate_text = features_for_prompts(candidate_labels)
+        view_ids = []
+        region_areas = []
+        for record in records:
+            view_ids.extend([record["path"].name] * len(record["features"]))
+            region_areas.extend(record["area_ratios"].tolist())
+        inventory = rank_scene_inventory(
+            stacked_raw, candidate_text, candidate_labels, view_ids,
+            region_areas, args.inventory_threshold, args.inventory_topk_per_region,
+        )
+        for item in inventory:
+            item["selected_tier"] = selected_inventory_tiers.get(item["label"])
+        with open(scene / "scene_inventory.json", "w", encoding="utf-8") as handle:
+            json.dump({
+                "version": 1,
+                "method": "SAM regions + CLIP verification",
+                "candidate_source": (
+                    str(Path(args.inventory_candidates_file).resolve())
+                    if args.inventory_candidates_file else "assets/scene_vocabulary.txt"
+                ),
+                "objects": inventory,
+            }, handle, ensure_ascii=False, indent=2)
     stacked_confidence = np.concatenate(
         [record["confidences"] for record in records], axis=0
     )
@@ -493,6 +571,12 @@ def main():
             ) if normal_text is not None else object_like
         )
         normal_regions &= object_like
+        background_regions = select_prompt_regions(
+            aggregated_features,
+            features_for_prompts(record["background_prompts"]),
+            args.importance_threshold, args.importance_topk,
+        )
+        normal_regions -= background_regions
         important_regions = select_prompt_regions(
             aggregated_features,
             features_for_prompts(record["important_prompts"]),
@@ -502,6 +586,7 @@ def main():
         importance = np.zeros(region_map.shape, dtype=np.uint8)
         importance[np.isin(region_map, list(normal_regions))] = 1
         importance[np.isin(region_map, list(important_regions))] = 2
+        importance[np.isin(region_map, list(background_regions))] = 0
         detail_weight, boundary, thinness, importance = build_detail_supervision(
             region_map, importance,
             boundary_width=args.boundary_width,
@@ -542,9 +627,11 @@ def main():
             maps_dir / f"{path.stem}.npz",
             features=dense.transpose(2, 0, 1).astype(np.float16),
             valid=valid.astype(np.uint8),
+            region_ids=region_map.astype(np.int16),
             confidence=confidence.astype(np.float16),
             hierarchy_features=hierarchy_dense.transpose(0, 3, 1, 2).astype(np.float16),
             hierarchy_valid=hierarchy_valid.astype(np.uint8),
+            hierarchy_region_ids=hierarchy_region_maps.astype(np.int16),
             hierarchy_confidence=hierarchy_confidence.astype(np.float16),
             importance=importance,
             detail_weight=detail_weight.astype(np.float16),
@@ -568,6 +655,7 @@ def main():
         "images": len(paths), "regions": int(stacked.shape[0]),
         "feature_dim": dimensions, "important_prompts": prompts,
         "normal_prompts": normal_prompts,
+        "background_prompts": background_prompts,
         "clip_model": args.clip_model, "clip_pretrained": args.clip_pretrained,
         "sam_model": args.sam_model,
         "mean_sam_confidence": float(np.mean(confidence_values)),
@@ -603,6 +691,8 @@ def main():
         ).tolist(),
         "important_json": str(Path(args.important_json).resolve()) if args.important_json else None,
         "images_subdir": args.images_subdir,
+        "scene_inventory": str(scene / "scene_inventory.json"),
+        "inventory_objects": len(inventory),
         "semantic_maps": str(maps_dir), "importance_masks": str(importance_dir),
         "detail_weights": str(detail_dir), "boundary_masks": str(boundary_dir),
     }

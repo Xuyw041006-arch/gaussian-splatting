@@ -8,6 +8,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from semantic.presets import apply_preset_defaults
+
 
 @dataclass
 class Step:
@@ -17,13 +23,34 @@ class Step:
 
 
 def build_steps(args):
+    args = apply_preset_defaults(args)
     repo = Path(__file__).resolve().parents[1]
     python = args.python
     scene = Path(args.scene).resolve()
     model = Path(args.model).resolve()
     scene_iteration = args.scene_iterations
     max_views = args.max_train_views
-    if args.sparse and max_views < 0:
+    capture_mode = args.capture_mode
+    if args.sparse:
+        capture_mode = "sparse"
+    if capture_mode == "auto":
+        image_dir = scene / args.semantic_images
+        image_count = len([
+            path for path in image_dir.glob("*") if path.is_file()
+        ]) if image_dir.is_dir() else 0
+        capture_mode = "sparse" if 1 < image_count <= 12 else "dense"
+    if capture_mode == "single":
+        image_path = Path(args.single_image).resolve() if args.single_image else scene
+        command = [
+            python, str(repo / "scripts" / "run_single_image.py"),
+            "--image", str(image_path), "--output", str(model),
+            "--luciddreamer_repo", str(Path(args.single_backend_repo).resolve()),
+            "--camera_path", args.single_camera_path,
+        ]
+        if args.single_prompt:
+            command.extend(["--prompt", args.single_prompt])
+        return [Step("single_complete", command, model / "single_completion.json")]
+    if capture_mode == "sparse" and max_views < 0:
         max_views = 8
 
     colmap = [python, str(repo / "convert.py"), "-s", str(scene), "--matcher", args.matcher]
@@ -47,6 +74,8 @@ def build_steps(args):
         "--thin_boost", str(args.thin_boost),
         "--thin_compactness", str(args.thin_compactness),
         "--thin_aspect_ratio", str(args.thin_aspect_ratio),
+        "--inventory_threshold", str(args.inventory_threshold),
+        "--inventory_topk_per_region", str(args.inventory_topk_per_region),
     ]
     if args.important:
         semantics.extend(["--important", args.important])
@@ -56,6 +85,21 @@ def build_steps(args):
         semantics.extend(["--normal", args.normal])
     if args.normal_json:
         semantics.extend(["--normal_json", str(Path(args.normal_json).resolve())])
+    if args.importance_config:
+        semantics.extend([
+            "--importance_config", str(Path(args.importance_config).resolve())
+        ])
+    if args.inventory_candidates:
+        semantics.extend(["--inventory_candidates", args.inventory_candidates])
+    if args.inventory_candidates_file:
+        semantics.extend([
+            "--inventory_candidates_file",
+            str(Path(args.inventory_candidates_file).resolve()),
+        ])
+    elif args.ram_checkpoint:
+        semantics.extend([
+            "--inventory_candidates_file", str(scene / "scene_tag_candidates.txt")
+        ])
 
     rgb = [
         python, str(repo / "train.py"), "-s", str(scene), "-m", str(model),
@@ -64,11 +108,14 @@ def build_steps(args):
         "--max_train_views", str(max_views), "--view_stride", str(args.view_stride),
         "--densify_from_iter", str(args.densify_from_iter),
         "--densify_until_iter", str(
-            min(args.densify_until_iter, max(1, int(scene_iteration * 0.75)))
+            min(args.densify_until_iter, max(1, int(scene_iteration * 0.80)))
         ),
         "--densify_grad_threshold", str(args.densify_grad_threshold),
     ]
-    if args.training_mode == "joint" or args.important or args.important_json:
+    if args.training_mode == "joint" or (
+        args.training_mode != "off"
+        and (args.important or args.important_json or args.importance_config)
+    ):
         rgb.extend([
             "--importance_mask_dir", str(scene / "importance_masks"),
             "--foreground_weight", str(args.foreground_weight),
@@ -79,6 +126,7 @@ def build_steps(args):
             "--joint_semantics", "--semantic_dir", str(scene / "semantic_maps"),
             "--sh_degree", str(args.joint_sh_degree),
             "--semantic_start", str(args.semantic_start),
+            "--semantic_ramp_iterations", str(args.semantic_ramp_iterations),
             "--semantic_weight", str(args.joint_semantic_weight),
             "--semantic_lr", str(args.semantic_lr),
             "--scale_gate_lr", str(args.scale_gate_lr),
@@ -87,6 +135,10 @@ def build_steps(args):
             "--semantic_spatial_samples", str(args.joint_spatial_samples),
             "--semantic_edge_sigma", str(args.semantic_edge_sigma),
             "--semantic_cross_view_weight", str(args.semantic_cross_view_weight),
+            "--semantic_boundary_weight", str(args.semantic_boundary_weight),
+            "--semantic_contrastive_weight", str(args.semantic_contrastive_weight),
+            "--semantic_contrastive_samples", str(args.semantic_contrastive_samples),
+            "--semantic_contrastive_every", str(args.semantic_contrastive_every),
             "--semantic_chunks_per_step", str(args.semantic_chunks_per_step),
             "--importance_ema", str(args.importance_ema),
             "--rgb_tier_weights", *map(str, args.rgb_tier_weights),
@@ -109,7 +161,7 @@ def build_steps(args):
         ])
     if args.depths:
         rgb.extend(["-d", args.depths])
-    if args.sparse:
+    if capture_mode == "sparse":
         rgb.extend([
             "--random_background", "--opacity_reset_interval", "1000",
         ])
@@ -123,10 +175,25 @@ def build_steps(args):
         "--spatial_k", str(args.spatial_k),
         "--spatial_samples", str(args.spatial_samples),
     ]
-    common = [
-        Step("colmap", colmap, scene / "sparse" / "0" / "images.bin"),
-        Step("semantics", semantics, scene / "semantic_meta.npz"),
-    ]
+    common = [Step("colmap", colmap, scene / "sparse" / "0" / "images.bin")]
+    if args.training_mode != "off":
+        if args.ram_checkpoint:
+            common.append(Step(
+                "tag_discovery",
+                [
+                    python, str(repo / "scripts" / "discover_scene_tags.py"),
+                    "--scene", str(scene), "--images_subdir", args.semantic_images,
+                    "--checkpoint", str(Path(args.ram_checkpoint).resolve()),
+                    "--max_images", str(args.tag_max_images),
+                ],
+                scene / "scene_tag_candidates.json",
+            ))
+        common.append(Step("semantics", semantics, scene / "semantic_meta.npz"))
+    if args.training_mode == "off":
+        return common + [Step(
+            "rgb", rgb,
+            model / "point_cloud" / f"iteration_{scene_iteration}" / "point_cloud.ply",
+        )]
     if args.training_mode == "joint":
         return common + [Step(
             "joint", rgb,
@@ -148,26 +215,45 @@ def make_parser():
     parser = argparse.ArgumentParser(description="3DGS semantic project pipeline")
     parser.add_argument("--scene", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--sam_checkpoint", required=True)
+    parser.add_argument("--sam_checkpoint", default="")
+    parser.add_argument("--preset", choices=["quick", "balanced", "quality"], default="balanced")
+    parser.add_argument(
+        "--capture_mode", choices=["auto", "dense", "sparse", "single"],
+        default="auto",
+    )
+    parser.add_argument("--single_image", default="")
+    parser.add_argument("--single_backend_repo", default="./third_party/LucidDreamer")
+    parser.add_argument("--single_prompt", default="")
+    parser.add_argument(
+        "--single_camera_path", choices=["lookdown", "lookaround", "rotate360"],
+        default="lookaround",
+    )
     parser.add_argument("--semantic_images", default="images")
     parser.add_argument("--sam_model", choices=["vit_b", "vit_l", "vit_h"], default="vit_h")
     parser.add_argument("--important", default="")
     parser.add_argument("--important_json", default="")
     parser.add_argument("--normal", default="")
     parser.add_argument("--normal_json", default="")
+    parser.add_argument("--importance_config", default="")
+    parser.add_argument("--inventory_candidates", default="")
+    parser.add_argument("--inventory_candidates_file", default="")
+    parser.add_argument("--inventory_threshold", type=float, default=0.22)
+    parser.add_argument("--inventory_topk_per_region", type=int, default=2)
+    parser.add_argument("--ram_checkpoint", default="")
+    parser.add_argument("--tag_max_images", type=int, default=48)
     parser.add_argument(
-        "--training_mode", choices=["joint", "sequential"], default="joint"
+        "--training_mode", choices=["joint", "sequential", "off"], default="joint"
     )
     parser.add_argument("--foreground_weight", type=float, default=3.0)
     parser.add_argument("--background_weight", type=float, default=0.75)
     parser.add_argument("--clip_model", default="ViT-H-14")
     parser.add_argument("--clip_pretrained", default="laion2b_s32b_b79k")
-    parser.add_argument("--feature_dim", type=int, default=32)
-    parser.add_argument("--feature_width", type=int, default=512)
-    parser.add_argument("--max_masks", type=int, default=192)
-    parser.add_argument("--points_per_side", type=int, default=32)
+    parser.add_argument("--feature_dim", type=int, default=None)
+    parser.add_argument("--feature_width", type=int, default=None)
+    parser.add_argument("--max_masks", type=int, default=None)
+    parser.add_argument("--points_per_side", type=int, default=None)
     parser.add_argument("--clip_batch_size", type=int, default=16)
-    parser.add_argument("--scene_iterations", type=int, default=15000)
+    parser.add_argument("--scene_iterations", type=int, default=None)
     parser.add_argument("--semantic_iterations", type=int, default=5000)
     parser.add_argument("--semantic_lr", type=float, default=0.005)
     parser.add_argument("--spatial_weight", type=float, default=0.012)
@@ -180,24 +266,29 @@ def make_parser():
     parser.add_argument("--thin_boost", type=float, default=1.50)
     parser.add_argument("--thin_compactness", type=float, default=0.40)
     parser.add_argument("--thin_aspect_ratio", type=float, default=2.5)
-    parser.add_argument("--joint_sh_degree", type=int, default=5)
-    parser.add_argument("--semantic_start", type=int, default=1000)
-    parser.add_argument("--joint_semantic_weight", type=float, default=0.22)
+    parser.add_argument("--joint_sh_degree", type=int, default=None)
+    parser.add_argument("--semantic_start", type=int, default=None)
+    parser.add_argument("--semantic_ramp_iterations", type=int, default=None)
+    parser.add_argument("--joint_semantic_weight", type=float, default=None)
     parser.add_argument("--scale_gate_lr", type=float, default=0.001)
     parser.add_argument("--spatial_every", type=int, default=8)
-    parser.add_argument("--joint_spatial_samples", type=int, default=768)
+    parser.add_argument("--joint_spatial_samples", type=int, default=None)
     parser.add_argument("--semantic_edge_sigma", type=float, default=0.12)
-    parser.add_argument("--semantic_cross_view_weight", type=float, default=0.06)
-    parser.add_argument("--semantic_chunks_per_step", type=int, default=3)
+    parser.add_argument("--semantic_cross_view_weight", type=float, default=None)
+    parser.add_argument("--semantic_boundary_weight", type=float, default=None)
+    parser.add_argument("--semantic_contrastive_weight", type=float, default=None)
+    parser.add_argument("--semantic_contrastive_samples", type=int, default=None)
+    parser.add_argument("--semantic_contrastive_every", type=int, default=4)
+    parser.add_argument("--semantic_chunks_per_step", type=int, default=None)
     parser.add_argument("--importance_ema", type=float, default=0.90)
     parser.add_argument("--rgb_tier_weights", nargs=3, type=float, default=(0.30, 1.20, 5.0))
     parser.add_argument("--semantic_tier_weights", nargs=3, type=float, default=(0.12, 1.25, 5.0))
     parser.add_argument("--tier_densify_multipliers", nargs=3, type=float, default=(1.25, 0.72, 0.35))
     parser.add_argument("--tier_opacity_multipliers", nargs=3, type=float, default=(1.25, 0.70, 0.25))
-    parser.add_argument("--tier_sh_degrees", nargs=3, type=int, default=(1, 3, 5))
+    parser.add_argument("--tier_sh_degrees", nargs=3, type=int, default=None)
     parser.add_argument("--densify_from_iter", type=int, default=500)
-    parser.add_argument("--densify_until_iter", type=int, default=11250)
-    parser.add_argument("--densify_grad_threshold", type=float, default=0.0001)
+    parser.add_argument("--densify_until_iter", type=int, default=None)
+    parser.add_argument("--densify_grad_threshold", type=float, default=None)
     parser.add_argument("--sparse", action="store_true")
     parser.add_argument("--max_train_views", type=int, default=-1)
     parser.add_argument("--view_stride", type=int, default=1)
@@ -224,13 +315,22 @@ def make_parser():
 
 def main():
     parser = make_parser()
-    args = parser.parse_args()
+    args = apply_preset_defaults(parser.parse_args())
     selected = {name.strip() for name in args.stages.split(",") if name.strip()}
-    allowed = {"colmap", "semantics", "joint", "rgb", "semantic"}
+    allowed = {"colmap", "tag_discovery", "semantics", "joint", "rgb", "semantic", "single_complete"}
     if selected == {"all"}:
         selected = {step.name for step in build_steps(args)}
     if not selected or not selected <= allowed:
         parser.error(f"--stages must use only: {','.join(sorted(allowed))}")
+    if args.capture_mode == "single" and args.training_mode != "off":
+        parser.error(
+            "single-image completion is generative RGB, not measured multi-view "
+            "reconstruction; use --training_mode off"
+        )
+    if args.capture_mode == "single" and not args.single_image:
+        parser.error("--single_image is required for single-image completion")
+    if args.training_mode != "off" and not args.sam_checkpoint:
+        parser.error("--sam_checkpoint is required when semantic training is enabled")
     if args.view_stride < 1 or args.max_train_views == 0 or args.max_train_views == 1:
         parser.error("--view_stride must be >=1; --max_train_views must be -1 or >=2")
     if min(
@@ -240,6 +340,9 @@ def main():
         args.densify_until_iter, args.cross_view_prototypes,
         args.spatial_every, args.joint_spatial_samples,
         args.semantic_chunks_per_step, args.boundary_width,
+        args.semantic_contrastive_samples, args.semantic_contrastive_every,
+        args.inventory_topk_per_region,
+        args.tag_max_images,
     ) < 1:
         parser.error("Training counts, dimensions, and sampling values must be positive")
     if min(args.foreground_weight, args.background_weight, args.semantic_lr) <= 0:
@@ -250,6 +353,9 @@ def main():
         or args.thin_compactness <= 0 or args.thin_aspect_ratio <= 1
         or args.semantic_edge_sigma <= 0
         or args.semantic_cross_view_weight < 0
+        or args.semantic_boundary_weight < 0
+        or args.semantic_contrastive_weight < 0
+        or args.semantic_ramp_iterations < 0
         or args.validation_interval < 0 or args.validation_start < 0
         or args.early_stop_patience < 0
         or args.early_stop_min_delta < 0

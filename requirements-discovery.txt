@@ -1,0 +1,3 @@
+# Optional open-vocabulary proposal stage. SAM + CLIP verification still uses
+# requirements-semantic.txt.
+git+https://github.com/xinyu1205/recognize-anything.git

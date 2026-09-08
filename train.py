@@ -187,7 +187,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        if joint is not None:
+        joint_capacity_active = (
+            joint is not None and iteration >= joint_args.semantic_start
+        )
+        if joint_capacity_active:
             joint.observe_importance(viewpoint_cam, visibility_filter)
 
         if viewpoint_cam.alpha_mask is not None:
@@ -201,6 +204,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image.device, importance_cache
         )
         if importance_mask is None:
+            Ll1 = l1_loss(image, gt_image)
+        elif joint is not None and not joint_capacity_active:
+            # Geometry first: the warm-up phase is intentionally pure RGB and
+            # does not let noisy early importance maps steer reconstruction.
             Ll1 = l1_loss(image, gt_image)
         elif joint is not None:
             Ll1 = weighted_tier_l1(
@@ -239,7 +246,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += joint_result["loss"]
 
         loss.backward()
-        if joint is not None:
+        if joint_capacity_active:
             gaussians.mask_sh_gradients(*joint_args.tier_sh_degrees)
 
         iter_end.record()
@@ -281,8 +288,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold, 0.005, scene.cameras_extent,
                         size_threshold, radii,
-                        joint_args.tier_densify_multipliers if joint is not None else None,
-                        joint_args.tier_opacity_multipliers if joint is not None else None,
+                        joint_args.tier_densify_multipliers if joint_capacity_active else None,
+                        joint_args.tier_opacity_multipliers if joint_capacity_active else None,
                     )
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
@@ -301,7 +308,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 if joint is not None:
                     joint.step()
-                    gaussians.enforce_sh_capacity(*joint_args.tier_sh_degrees)
+                    if joint_capacity_active:
+                        gaussians.enforce_sh_capacity(*joint_args.tier_sh_degrees)
 
             if (
                 joint_args.validation_interval > 0
@@ -322,6 +330,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if joint is not None and iteration >= joint_args.semantic_start:
                     semantic_values = []
                     cross_view_values = []
+                    boundary_values = []
                     semantic_eval_iteration = iteration
                     while semantic_eval_iteration % 3 != 1:
                         semantic_eval_iteration += 1
@@ -342,6 +351,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             cross_view_values.append(
                                 float(semantic_result["cross_view_loss"])
                             )
+                            boundary_values.append(
+                                float(semantic_result["boundary_loss"])
+                            )
                     if semantic_values:
                         validation_record["semantic_l1"] = sum(
                             semantic_values
@@ -349,6 +361,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         validation_record["cross_view_l1"] = sum(
                             cross_view_values
                         ) / len(cross_view_values)
+                        validation_record["boundary_l1"] = sum(
+                            boundary_values
+                        ) / len(boundary_values)
                 validation_history.append(validation_record)
                 print(
                     f"\n[ITER {iteration}] Validation PSNR {validation_psnr:.6f} "
@@ -550,6 +565,10 @@ if __name__ == "__main__":
     parser.add_argument("--joint_semantics", action="store_true")
     parser.add_argument("--semantic_dir", default="")
     parser.add_argument("--semantic_start", type=int, default=1000)
+    parser.add_argument(
+        "--semantic_ramp_iterations", type=int, default=2500,
+        help="Cosine ramp after the pure RGB warm-up; 0 restores a hard switch",
+    )
     parser.add_argument("--semantic_weight", type=float, default=0.22)
     parser.add_argument("--semantic_lr", type=float, default=0.005)
     parser.add_argument("--scale_gate_lr", type=float, default=0.001)
@@ -559,6 +578,10 @@ if __name__ == "__main__":
     parser.add_argument("--semantic_spatial_samples", type=int, default=768)
     parser.add_argument("--semantic_edge_sigma", type=float, default=0.12)
     parser.add_argument("--semantic_cross_view_weight", type=float, default=0.06)
+    parser.add_argument("--semantic_boundary_weight", type=float, default=0.08)
+    parser.add_argument("--semantic_contrastive_weight", type=float, default=0.05)
+    parser.add_argument("--semantic_contrastive_samples", type=int, default=320)
+    parser.add_argument("--semantic_contrastive_every", type=int, default=4)
     parser.add_argument("--semantic_chunks_per_step", type=int, default=3)
     parser.add_argument("--importance_ema", type=float, default=0.90)
     parser.add_argument("--validation_interval", type=int, default=0)
@@ -619,6 +642,9 @@ if __name__ == "__main__":
         if (
             args.semantic_start < 0 or args.semantic_spatial_every < 1
             or args.semantic_chunks_per_step < 1
+            or args.semantic_ramp_iterations < 0
+            or args.semantic_contrastive_samples < 3
+            or args.semantic_contrastive_every < 1
         ):
             parser.error("Semantic start/every values are invalid")
         if not 0 <= args.importance_ema < 1 or not 0 <= args.semantic_min_alpha < 1:
@@ -629,6 +655,8 @@ if __name__ == "__main__":
         args.validation_interval < 0 or args.validation_start < 0
         or args.early_stop_patience < 0 or args.early_stop_min_delta < 0
         or args.semantic_cross_view_weight < 0
+        or args.semantic_boundary_weight < 0
+        or args.semantic_contrastive_weight < 0
     ):
         parser.error("Validation and cross-view parameters must be non-negative")
     training(
