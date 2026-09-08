@@ -118,7 +118,8 @@ def detail_preprocessing_complete(scene):
         with np.load(maps[0]) as semantic_map:
             required = {
                 "detail_weight", "boundary", "thinness", "prototype_ids",
-                "hierarchy_prototype_ids",
+                "hierarchy_prototype_ids", "region_ids",
+                "hierarchy_region_ids",
             }
             return required.issubset(semantic_map.files)
     except (OSError, ValueError):

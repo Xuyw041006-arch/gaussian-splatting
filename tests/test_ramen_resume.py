@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from scripts.run_ramen_benchmark import (
+    detail_preprocessing_complete,
     estimate_completed_training_seconds,
     latest_checkpoint,
     select_validation_views,
@@ -14,6 +15,35 @@ from scripts.run_ramen_benchmark import (
 
 
 class RamenResumeTests(unittest.TestCase):
+    def test_preprocessing_cache_requires_region_hierarchy(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy is optional for this unit test")
+
+        with tempfile.TemporaryDirectory() as directory:
+            scene = Path(directory)
+            maps = scene / "semantic_maps"
+            maps.mkdir()
+            np.savez(scene / "semantic_meta.npz", prototype_features=np.zeros((1, 2)))
+            legacy = {
+                "detail_weight": np.ones((2, 2)),
+                "boundary": np.zeros((2, 2)),
+                "thinness": np.zeros((2, 2)),
+                "prototype_ids": np.zeros((2, 2)),
+                "hierarchy_prototype_ids": np.zeros((3, 2, 2)),
+            }
+            np.savez(maps / "frame.npz", **legacy)
+            self.assertFalse(detail_preprocessing_complete(scene))
+
+            np.savez(
+                maps / "frame.npz",
+                **legacy,
+                region_ids=np.zeros((2, 2)),
+                hierarchy_region_ids=np.zeros((3, 2, 2)),
+            )
+            self.assertTrue(detail_preprocessing_complete(scene))
+
     def test_completed_training_time_can_be_recovered_from_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
