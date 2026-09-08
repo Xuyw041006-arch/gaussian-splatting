@@ -1,4 +1,7 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -68,6 +71,24 @@ class WebBundleTests(unittest.TestCase):
     def test_label_specs_support_bilingual_metadata(self):
         specs = read_label_specs("apple,cup", "")
         self.assertEqual([item["label"] for item in specs], ["apple", "cup"])
+        self.assertEqual([item["importance"] for item in specs], ["normal", "normal"])
+
+    def test_label_specs_support_importance_tiers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "labels.json"
+            path.write_text(json.dumps({"objects": [
+                {"label": "ramen", "label_zh": "拉面", "tier": "important"},
+                {"label": "table", "importance": "background"},
+            ]}), encoding="utf-8")
+            specs = read_label_specs("", str(path))
+        self.assertEqual([item["importance"] for item in specs], ["important", "background"])
+
+    def test_label_specs_reject_unknown_importance_tier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "labels.json"
+            path.write_text(json.dumps([{"label": "ramen", "tier": "urgent"}]), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid importance"):
+                read_label_specs("", str(path))
 
     def test_assignment_is_disjoint_and_respects_threshold(self):
         groups = assign_disjoint_indices(

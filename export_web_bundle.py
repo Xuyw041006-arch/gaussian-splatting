@@ -12,6 +12,10 @@ import torch
 from semantic.artifact import apply_scale_gate, cosine_scores, decode_features, project_clip_feature
 
 
+IMPORTANCE_LEVELS = ("background", "normal", "important")
+IMPORTANCE_THRESHOLDS = (0.25, 0.75)
+
+
 def read_label_specs(labels, labels_json):
     if labels_json:
         with open(labels_json, encoding="utf-8") as handle:
@@ -33,6 +37,12 @@ def read_label_specs(labels, labels_json):
         prompt = str(value.get("prompt") or label).strip()
         if not label or not prompt:
             raise ValueError(f"Label entry {index} has no label/prompt")
+        importance = str(value.get("importance") or value.get("tier") or "normal").strip().lower()
+        if importance not in IMPORTANCE_LEVELS:
+            raise ValueError(
+                f"Label entry {index} has invalid importance {importance!r}; "
+                f"expected one of {', '.join(IMPORTANCE_LEVELS)}"
+            )
         specs.append({
             "id": str(value.get("id") or f"object-{index:03d}"),
             "label": label,
@@ -40,6 +50,7 @@ def read_label_specs(labels, labels_json):
             "prompt": prompt,
             "description": str(value.get("description") or "").strip() or None,
             "aliases": [str(item).strip() for item in value.get("aliases", []) if str(item).strip()],
+            "importance": importance,
         })
     return specs
 
@@ -104,7 +115,7 @@ def main():
     if not artifact_path.is_file() or not ply_path.is_file():
         parser.error(f"Missing RGB/semantic artifact for iteration {iteration}")
 
-    artifact = torch.load(artifact_path, map_location="cpu")
+    artifact = torch.load(artifact_path, map_location="cpu", weights_only=False)
     try:
         import open_clip
     except ImportError as error:
@@ -143,9 +154,25 @@ def main():
     score_matrix = np.column_stack([cosine_scores(decoded, query) for query in queries])
     groups = assign_disjoint_indices(score_matrix, args.threshold, args.top_k)
 
-    vertex_count = len(PlyData.read(ply_path)["vertex"].data)
+    vertices = PlyData.read(ply_path)["vertex"].data
+    vertex_count = len(vertices)
     if vertex_count != len(decoded):
         raise RuntimeError(f"Point/semantic count mismatch: {vertex_count} vs {len(decoded)}")
+    xyz = np.column_stack((vertices["x"], vertices["y"], vertices["z"])).astype(
+        np.float32, copy=False
+    )
+    importance_score = artifact.get("importance_score")
+    if importance_score is None:
+        importance_score = np.full(vertex_count, 0.5, dtype=np.float32)
+    elif torch.is_tensor(importance_score):
+        importance_score = importance_score.float().numpy()
+    else:
+        importance_score = np.asarray(importance_score, dtype=np.float32)
+    importance_score = importance_score.reshape(-1)
+    if len(importance_score) != vertex_count:
+        raise RuntimeError(
+            f"Point/importance count mismatch: {vertex_count} vs {len(importance_score)}"
+        )
     output_dir = Path(args.output_dir).resolve() if args.output_dir else (
         model_path / "web_export" / f"iteration_{iteration}"
     )
@@ -156,24 +183,69 @@ def main():
     objects = []
     for label_index, (spec, indices) in enumerate(zip(specs, groups)):
         selected_scores = score_matrix[indices, label_index]
+        selected_xyz = xyz[indices]
+        selected_importance = importance_score[indices]
         objects.append({
             "id": spec["id"],
             "label": spec["label"],
             "label_zh": spec["label_zh"],
             "description": spec["description"] or f"CLIP prompt: {spec['prompt']}",
             "aliases": spec["aliases"],
+            "importance": spec["importance"],
             "indices": indices.astype(int).tolist(),
             "score_max": float(selected_scores.max()) if len(indices) else None,
             "score_mean": float(selected_scores.mean()) if len(indices) else None,
+            "importance_score_min": (
+                float(selected_importance.min()) if len(indices) else None
+            ),
+            "importance_score_mean": (
+                float(selected_importance.mean()) if len(indices) else None
+            ),
+            "importance_score_max": (
+                float(selected_importance.max()) if len(indices) else None
+            ),
+            "centroid": (
+                selected_xyz.mean(axis=0).astype(float).tolist() if len(indices) else None
+            ),
+            "bounds": ({
+                "min": selected_xyz.min(axis=0).astype(float).tolist(),
+                "max": selected_xyz.max(axis=0).astype(float).tolist(),
+            } if len(indices) else None),
         })
+    background_max, important_min = IMPORTANCE_THRESHOLDS
+    tier_indices = np.where(
+        importance_score < background_max,
+        0,
+        np.where(importance_score >= important_min, 2, 1),
+    )
+    tier_counts = {
+        label: int((tier_indices == index).sum())
+        for index, label in enumerate(IMPORTANCE_LEVELS)
+    }
     payload = {
-        "version": 1,
+        "version": 2,
         "model": output_ply.name,
         "model_sha256": file_sha256(output_ply),
         "scene_iteration": iteration,
         "total_gaussians": vertex_count,
         "threshold": args.threshold,
         "granularity": args.granularity,
+        "semantic": {
+            "training": str(artifact.get("training", "unknown")),
+            "encoding": "pca-clip",
+            "dimensions": int(decoded.shape[1]),
+            "clip_model": str(artifact.get("clip_model", "unknown")),
+            "clip_pretrained": str(artifact.get("clip_pretrained", "unknown")),
+            "granularity_levels": ["coarse", "middle", "fine"],
+            "cross_view_weight": float(artifact.get("semantic_cross_view_weight", 0.0)),
+            "edge_sigma": float(artifact.get("semantic_edge_sigma", 0.0)),
+        },
+        "importance": {
+            "levels": list(IMPORTANCE_LEVELS),
+            "background_max": background_max,
+            "important_min": important_min,
+            "counts": tier_counts,
+        },
         "objects": objects,
     }
     output_json = output_dir / "semantic_objects.json"

@@ -1,0 +1,67 @@
+{
+  "objects": [
+    {
+      "id": "egg",
+      "label": "soft-boiled egg",
+      "label_zh": "溏心蛋",
+      "prompt": "a sliced soft-boiled egg in a bowl of ramen",
+      "aliases": ["egg", "鸡蛋", "卤蛋", "味玉"],
+      "description": "拉面碗内切开的溏心蛋。",
+      "importance": "important"
+    },
+    {
+      "id": "pork-belly",
+      "label": "pork belly",
+      "label_zh": "叉烧肉",
+      "prompt": "slices of pork belly or chashu in ramen",
+      "aliases": ["pork", "chashu", "五花肉", "肉片", "叉烧"],
+      "description": "拉面上的叉烧或五花肉片。",
+      "importance": "important"
+    },
+    {
+      "id": "noodles",
+      "label": "ramen noodles",
+      "label_zh": "拉面面条",
+      "prompt": "wavy ramen noodles inside the bowl",
+      "aliases": ["noodle", "noodles", "面", "面条", "波浪面"],
+      "description": "碗内可见的波浪形拉面面条。",
+      "importance": "important"
+    },
+    {
+      "id": "yellow-bowl",
+      "label": "yellow ramen bowl",
+      "label_zh": "黄色拉面碗",
+      "prompt": "the yellow ceramic bowl holding the ramen",
+      "aliases": ["bowl", "碗", "黄色碗", "餐具"],
+      "description": "盛放拉面的黄色陶瓷碗。",
+      "importance": "normal"
+    },
+    {
+      "id": "chopsticks",
+      "label": "chopsticks",
+      "label_zh": "筷子",
+      "prompt": "a pair of chopsticks next to the ramen bowl",
+      "aliases": ["chopstick", "餐筷"],
+      "description": "场景中的一双筷子，属于细长边界物体。",
+      "importance": "important"
+    },
+    {
+      "id": "water-glass",
+      "label": "glass of water",
+      "label_zh": "玻璃水杯",
+      "prompt": "a transparent glass filled with water next to the ramen",
+      "aliases": ["glass", "water", "cup", "杯子", "水杯", "玻璃杯"],
+      "description": "拉面旁透明的玻璃水杯。",
+      "importance": "normal"
+    },
+    {
+      "id": "table-surface",
+      "label": "table surface",
+      "label_zh": "桌面背景",
+      "prompt": "the table surface and background behind the ramen",
+      "aliases": ["table", "background", "桌子", "背景"],
+      "description": "承载主体物体的桌面及环境背景。",
+      "importance": "background"
+    }
+  ]
+}
