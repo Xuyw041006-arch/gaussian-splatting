@@ -108,6 +108,15 @@ class GaussianModel:
         self.spatial_lr_scale) = model_args[:12]
         self.training_setup(training_args)
         if joint_state is not None:
+            # ``restore`` is also used in-place when selecting the best
+            # validation checkpoint at the end of training.  In that case an
+            # existing semantic parameter is still attached to this model.
+            # ``training_setup`` above has just rebuilt the RGB optimizer, so
+            # keeping that old parameter makes ``setup_joint_semantics`` return
+            # early and leaves the optimizer with one group fewer than the
+            # checkpoint.  Recreate the semantic parameter from the checkpoint
+            # so both its value and optimizer group are restored consistently.
+            self._semantic_features = None
             self.setup_joint_semantics(
                 joint_state["semantic_features"].shape[1],
                 joint_state.get("semantic_lr", 0.005),
