@@ -27,8 +27,11 @@ OLD_JOINT = (
 
 
 def digest(path):
+    checksum = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
 
 
 def main():
@@ -55,13 +58,14 @@ def main():
             parser.error(f"Required retained artifact unavailable: {path}")
     if args.superseded_joint:
         import torch
-        state, step = torch.load(required[2], map_location="cpu", weights_only=False)
+        payload = torch.load(required[2], map_location="cpu", weights_only=False)
+        state, step = payload[:2]
         if int(step) <= 7000 or len(state) < 13 or state[12] is None:
             parser.error("Best checkpoint does not supersede the old joint checkpoint")
         if state[1].ndim != 2 or not torch.isfinite(state[1]).all():
             parser.error("Best checkpoint geometry is invalid")
         print(f"Validated retained best checkpoint: iteration={step}, gaussians={len(state[1])}", flush=True)
-        del state
+        del state, payload
     names = CACHES + (OLD_JOINT if args.superseded_joint else ())
     paths = [root / name for name in names if (root / name).is_file()]
     for path in paths:

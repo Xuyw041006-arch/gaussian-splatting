@@ -2,6 +2,7 @@
 
 import os
 import json
+import math
 import time
 from argparse import ArgumentParser
 from functools import lru_cache
@@ -54,15 +55,33 @@ def save_artifact(path, logits, scene_iteration, semantic_step, meta):
     torch.save(artifact, path)
 
 
-def save_training_checkpoint(path, logits, optimizer, step):
+def semantic_elapsed_state(checkpoint):
+    """Read the cumulative checkpointed loop time without guessing legacy time."""
+    value = checkpoint.get("observed_elapsed_seconds", checkpoint.get("elapsed_seconds"))
+    valid = isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+    return (
+        float(value) if valid else 0.0,
+        bool(valid and checkpoint.get("elapsed_seconds_complete", False)),
+    )
+
+
+def semantic_budget_exhausted(max_seconds, previous_seconds, session_seconds):
+    return max_seconds > 0 and previous_seconds + session_seconds >= max_seconds
+
+
+def save_training_checkpoint(path, logits, optimizer, step, elapsed_seconds, timing_complete):
     """Atomically save resumable semantic state, including Adam moments."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = f"{path}.tmp"
     torch.save({
-        "version": 1,
+        "version": 2,
         "step": int(step),
         "logits": logits.detach(),
         "optimizer": optimizer.state_dict(),
+        "elapsed_seconds": float(elapsed_seconds) if timing_complete else None,
+        "observed_elapsed_seconds": float(elapsed_seconds),
+        "elapsed_seconds_complete": bool(timing_complete),
+        "elapsed_seconds_scope": "checkpointed_training_loop",
     }, temporary)
     os.replace(temporary, path)
 
@@ -78,7 +97,7 @@ def main():
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument(
         "--max_seconds", type=float, default=0.0,
-        help="Optional wall-clock budget; zero disables the limit",
+        help="Cumulative checkpointed training-loop budget across resumes; zero disables the limit",
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--spatial_weight", type=float, default=0.02)
@@ -127,6 +146,8 @@ def main():
     )
     optimizer = torch.optim.Adam([logits], lr=args.semantic_lr)
     first_step = 0
+    previous_seconds = 0.0
+    timing_complete = True
     if args.resume and os.path.isfile(checkpoint_path):
         state = torch.load(checkpoint_path, map_location="cuda")
         if tuple(state["logits"].shape) != tuple(logits.shape):
@@ -135,6 +156,13 @@ def main():
             logits.copy_(state["logits"])
         optimizer.load_state_dict(state["optimizer"])
         first_step = int(state["step"])
+        previous_seconds, timing_complete = semantic_elapsed_state(state)
+        if args.max_seconds > 0 and not timing_complete:
+            parser.error(
+                "The semantic checkpoint has no complete historical timing. "
+                "Use --max_seconds 0 for a fixed-iteration resume; an equal-time "
+                "result cannot be certified from this legacy checkpoint."
+            )
         print(f"Resuming semantic training from step {first_step}")
 
     neighbor_indices = neighbor_weights = None
@@ -167,6 +195,12 @@ def main():
     final_step = first_step
     stopped_by_time = False
     for step in progress:
+        if semantic_budget_exhausted(
+            args.max_seconds, previous_seconds, time.monotonic() - training_started
+        ):
+            stopped_by_time = True
+            print(f"Cumulative semantic time budget exhausted at step {final_step}")
+            break
         final_step = step
         if not stack:
             stack = available.copy()
@@ -234,12 +268,17 @@ def main():
             )
         if args.save_every > 0 and step % args.save_every == 0:
             save_artifact(output_path, logits, scene.loaded_iter, step, meta)
-            save_training_checkpoint(checkpoint_path, logits, optimizer, step)
-        if args.max_seconds > 0 and time.monotonic() - training_started >= args.max_seconds:
+            save_training_checkpoint(
+                checkpoint_path, logits, optimizer, step,
+                previous_seconds + time.monotonic() - training_started, timing_complete,
+            )
+        if semantic_budget_exhausted(
+            args.max_seconds, previous_seconds, time.monotonic() - training_started
+        ):
             stopped_by_time = True
             print(
                 f"Reached semantic wall-clock budget after step {step} "
-                f"({time.monotonic() - training_started:.1f}s)"
+                f"({previous_seconds + time.monotonic() - training_started:.1f}s cumulative)"
             )
             break
 
@@ -247,13 +286,20 @@ def main():
         output_path, logits, scene.loaded_iter, final_step, meta
     )
     save_training_checkpoint(
-        checkpoint_path, logits, optimizer, final_step
+        checkpoint_path, logits, optimizer, final_step,
+        previous_seconds + time.monotonic() - training_started, timing_complete,
     )
     with open(completion_path, "w", encoding="utf-8") as handle:
         json.dump({
             "semantic_iterations": final_step,
             "requested_semantic_iterations": args.semantic_iterations,
-            "elapsed_seconds": time.monotonic() - training_started,
+            "elapsed_seconds": (
+                previous_seconds + time.monotonic() - training_started
+                if timing_complete else None
+            ),
+            "observed_elapsed_seconds": previous_seconds + time.monotonic() - training_started,
+            "elapsed_seconds_complete": timing_complete,
+            "elapsed_seconds_scope": "checkpointed_training_loop",
             "max_seconds": args.max_seconds,
             "stopped_by_time": stopped_by_time,
         }, handle, indent=2)

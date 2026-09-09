@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
@@ -47,11 +48,10 @@ def save_json(path, payload):
 
 
 def estimate_completed_training_seconds(model, iteration):
-    """Recover elapsed time when a completed subprocess failed after saving.
+    """Estimate an artifact interval, never a certified training duration.
 
-    The benchmark records wall time only after ``train.py`` exits cleanly.  If
-    post-training selection fails, the saved artifacts still provide a useful
-    start/end interval so ``--resume`` can preserve the equal-time protocol.
+    Copies, restarts and downtime can change this interval. Keep it separate
+    from measured durations when recovering models whose trainer did not exit.
     """
     model = Path(model)
     starts = [model / "cfg_args", model / "cameras.json"]
@@ -67,6 +67,65 @@ def estimate_completed_training_seconds(model, iteration):
         path.stat().st_mtime for path in starts
     )
     return float(elapsed) if elapsed > 0 else None
+
+
+def valid_seconds(value):
+    return (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and math.isfinite(value) and value >= 0
+    )
+
+
+def record_stage_timing(timings, name, elapsed, resumed=False, completed=True):
+    """Preserve known runtime, but never turn a resumed segment into a total."""
+    previous = timings.get(name)
+    history_known = not resumed or (
+        valid_seconds(previous)
+        and timings.get(name + "_timing_complete") is True
+        and not timings.get(name + "_interrupted_unknown")
+    )
+    observed = timings.get(name + "_observed_seconds", 0.0) if resumed else 0.0
+    timings[name + "_observed_seconds"] = float(observed or 0.0) + elapsed
+    timings[name] = (float(previous or 0.0) if resumed else 0.0) + elapsed if history_known else None
+    timings[name + "_timing_complete"] = history_known
+    timings[name + "_completed"] = completed
+    timings[name + "_source"] = "measured_subprocess" if history_known else "resumed_missing_history"
+    timings[name + "_run_in_progress"] = False
+
+
+def timing_protocol(timings, requested):
+    """Distinguish a requested budget from a verifiable equal-time result."""
+    names = ("joint_train_seconds", "sequential_rgb_seconds", "sequential_semantic_seconds")
+    missing = [name for name in names if not (
+        valid_seconds(timings.get(name))
+        and timings.get(name + "_timing_complete") is True
+        and timings.get(name + "_completed") is True
+    )]
+    known = not missing
+    total = sum(timings[name] for name in names[1:]) if not any(
+        name in missing for name in names[1:]
+    ) else None
+    delta = total - timings[names[0]] if known else None
+    timings["sequential_total_seconds"] = total
+    timings["wall_clock_delta_seconds"] = delta
+    # Process setup, checkpoint serialization and a final optimizer step can
+    # slightly overshoot. Report the tolerance explicitly, never hide the delta.
+    tolerance = max(5.0, 0.02 * timings[names[0]]) if known else None
+    certified = bool(requested and known and abs(delta) <= tolerance)
+    if not requested:
+        reason = "fixed_iteration_protocol"
+    elif missing:
+        reason = "unverified_or_missing_duration: " + ", ".join(missing)
+    elif not certified:
+        reason = "measured_durations_do_not_match"
+    else:
+        reason = "measured_durations_match_within_tolerance"
+    return {
+        "equal_wall_clock_requested": bool(requested),
+        "equal_wall_clock": certified,
+        "timing_status": reason,
+        "equal_time_tolerance_seconds": tolerance,
+    }
 
 
 def latest_checkpoint(model, maximum):
@@ -137,6 +196,15 @@ def main():
     parser.add_argument("--semantic_ramp_iterations", type=int, default=2500)
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--feature_width", type=int, default=512)
+    parser.add_argument(
+        "--joint_sh_degree", type=int, default=3, choices=range(4),
+        help="New joint training SH degree supported by the stock CUDA rasterizer (0-3)",
+    )
+    parser.add_argument(
+        "--tier_sh_degrees", type=int, nargs=3, default=[1, 2, 3],
+        metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
+        help="New joint training SH degrees for each importance tier",
+    )
     parser.add_argument("--validation_views", type=int, default=12)
     parser.add_argument("--validation_interval", type=int, default=1000)
     parser.add_argument("--early_stop_patience", type=int, default=4)
@@ -155,6 +223,10 @@ def main():
         help="Reuse preprocessing, completed stages, and the latest training checkpoints",
     )
     args = parser.parse_args()
+    if args.skip_baseline and args.skip_joint:
+        parser.error("At least one of baseline or joint must be selected")
+    if any(not 0 <= degree <= args.joint_sh_degree for degree in args.tier_sh_degrees):
+        parser.error("tier SH degrees must be between 0 and --joint_sh_degree (at most 3)")
 
     if min(
         args.iterations, args.semantic_iterations, args.feature_dim,
@@ -249,9 +321,19 @@ def main():
     timing_path = output_root / "training_times.json"
     timings = load_json(timing_path, {})
 
-    def run_stage(name, command):
-        elapsed = run(command, repo)
-        timings[name] = float(elapsed)
+    def run_stage(name, command, resumed=False):
+        if resumed and timings.get(name + "_run_in_progress"):
+            timings[name + "_interrupted_unknown"] = True
+        timings[name + "_run_in_progress"] = True
+        save_json(timing_path, timings)
+        started = time.monotonic()
+        try:
+            elapsed = run(command, repo)
+        except (subprocess.CalledProcessError, KeyboardInterrupt):
+            record_stage_timing(timings, name, time.monotonic() - started, resumed, False)
+            save_json(timing_path, timings)
+            raise
+        record_stage_timing(timings, name, elapsed, resumed)
         save_json(timing_path, timings)
         return elapsed
 
@@ -272,7 +354,7 @@ def main():
                     sys.executable, repo / "train.py", "-m", joint,
                     *common_train,
                     "--joint_semantics", "--semantic_dir", scene / "semantic_maps",
-                    "--sh_degree", 5, "--semantic_start", args.semantic_start,
+                    "--sh_degree", args.joint_sh_degree, "--semantic_start", args.semantic_start,
                     "--semantic_ramp_iterations", args.semantic_ramp_iterations,
                     "--semantic_weight", 0.22, "--semantic_lr", 0.01,
                     "--scale_gate_lr", 0.001,
@@ -280,7 +362,7 @@ def main():
                     "--semantic_tier_weights", 0.12, 1.25, 5.0,
                     "--tier_densify_multipliers", 1.25, 0.72, 0.35,
                     "--tier_opacity_multipliers", 1.25, 0.70, 0.25,
-                    "--tier_sh_degrees", 1, 3, 5,
+                    "--tier_sh_degrees", *args.tier_sh_degrees,
                     "--semantic_spatial_weight", 0.012,
                     "--semantic_spatial_every", 8,
                     "--semantic_spatial_samples", 768,
@@ -295,26 +377,21 @@ def main():
                 checkpoint = latest_checkpoint(joint, args.iterations)
                 if args.resume and checkpoint is not None:
                     command.extend(("--start_checkpoint", checkpoint))
-                run_stage("joint_train_seconds", command)
+                run_stage("joint_train_seconds", command, bool(args.resume and checkpoint))
             else:
                 print("Reusing completed joint model", flush=True)
                 if "joint_train_seconds" not in timings:
                     recovered = estimate_completed_training_seconds(
                         joint, args.iterations
                     )
-                    if recovered is None:
-                        if args.equal_time:
-                            raise RuntimeError(
-                                "Cannot recover joint wall time for the equal-time "
-                                "baseline. Re-run the joint stage or provide "
-                                "training_times.json."
-                            )
-                    else:
+                    if recovered is not None:
                         timings["joint_train_seconds"] = recovered
                         timings["joint_train_seconds_recovered"] = True
+                        timings["joint_train_seconds_timing_complete"] = False
+                        timings["joint_train_seconds_source"] = "artifact_interval_estimate"
                         save_json(timing_path, timings)
                         print(
-                            f"Recovered joint wall time: {recovered:.3f}s",
+                            f"Estimated joint artifact interval: {recovered:.3f}s (unverified)",
                             flush=True,
                         )
 
@@ -332,15 +409,22 @@ def main():
                 checkpoint = latest_checkpoint(baseline, args.iterations)
                 if args.resume and checkpoint is not None:
                     command.extend(("--start_checkpoint", checkpoint))
-                run_stage("sequential_rgb_seconds", command)
+                run_stage("sequential_rgb_seconds", command, bool(args.resume and checkpoint))
             else:
                 print("Reusing completed sequential RGB model", flush=True)
 
             joint_seconds = timings.get("joint_train_seconds")
-            rgb_seconds = timings.get("sequential_rgb_seconds", 0.0)
+            rgb_seconds = timings.get("sequential_rgb_seconds")
             equal_time_available = (
-                args.equal_time and joint_seconds is not None
+                args.equal_time and valid_seconds(joint_seconds)
+                and valid_seconds(rgb_seconds) and joint_seconds > rgb_seconds
             )
+            if args.equal_time and not equal_time_available:
+                print(
+                    "Equal-time budget unavailable (missing history or RGB already "
+                    "exceeds budget); using fixed semantic iterations. The comparison "
+                    "will not certify equal wall time.", flush=True,
+                )
             semantic_target = (
                 args.equal_time_semantic_cap
                 if equal_time_available else args.semantic_iterations
@@ -361,17 +445,26 @@ def main():
                     "--spatial_k", 8, "--spatial_samples", 4096,
                 ]
                 if equal_time_available:
-                    remaining = max(1.0, float(joint_seconds) - float(rgb_seconds))
+                    remaining = float(joint_seconds) - float(rgb_seconds)
                     command.extend(("--max_seconds", f"{remaining:.3f}"))
                     timings["sequential_semantic_budget_seconds"] = remaining
                 if args.resume:
                     command.append("--resume")
-                run_stage("sequential_semantic_seconds", command)
+                semantic_checkpoint = (
+                    baseline / "semantic" / f"iteration_{args.iterations}"
+                    / "semantic_checkpoint.pt"
+                )
+                run_stage(
+                    "sequential_semantic_seconds", command,
+                    args.resume and semantic_checkpoint.is_file(),
+                )
             else:
                 print("Reusing completed sequential semantic model", flush=True)
 
     results = {}
     for name, model in (("sequential", baseline), ("joint", joint)):
+        if (name == "sequential" and args.skip_baseline) or (name == "joint" and args.skip_joint):
+            continue
         output = output_root / f"eval_{name}"
         run([
             sys.executable, "-m", "scripts.evaluate_lerf_mask",
@@ -382,15 +475,7 @@ def main():
         ], repo)
         results[name] = json.loads((output / "metrics.json").read_text())
 
-    timings["sequential_total_seconds"] = float(
-        timings.get("sequential_rgb_seconds", 0.0)
-        + timings.get("sequential_semantic_seconds", 0.0)
-    )
-    if "joint_train_seconds" in timings:
-        timings["wall_clock_delta_seconds"] = float(
-            timings["sequential_total_seconds"]
-            - timings["joint_train_seconds"]
-        )
+    protocol = timing_protocol(timings, args.equal_time)
     save_json(timing_path, timings)
 
     summary = {
@@ -401,32 +486,23 @@ def main():
         "iterations": args.iterations,
         "semantic_iterations_baseline": args.semantic_iterations,
         "protocol": {
-            "equal_wall_clock": bool(args.equal_time),
+            **protocol,
             "requested_iteration_cap": args.iterations,
             "validation_views": len(validation_images),
             "validation_interval": args.validation_interval,
             "early_stop_patience": args.early_stop_patience,
             "timings_seconds": timings,
         },
-        "sequential": {
-            key: results["sequential"][key]
-            for key in (
-                "gaussians", "test_psnr", "test_ssim",
-                "test_important_psnr", "test_normal_psnr",
-                "mean_iou", "mean_boundary_iou",
-            )
-        },
-        "joint": {
-            key: results["joint"][key]
+    }
+    for name in results:
+        summary[name] = {
+            key: results[name][key]
             for key in (
                 "gaussians", "test_psnr", "test_ssim",
                 "test_important_psnr", "test_normal_psnr",
                 "mean_iou", "mean_boundary_iou", "tier_gaussians",
-            )
-            if key in results["joint"]
-        },
-    }
-    for name in ("sequential", "joint"):
+            ) if key in results[name]
+        }
         validation = load_json(
             output_root / name / "validation_summary.json", {}
         )
@@ -438,34 +514,20 @@ def main():
         summary[name]["normal_mean_iou"] = float(sum(
             per_label[label] for label in NORMAL.split(",")
         ) / len(NORMAL.split(",")))
-    summary["delta"] = {
-        "gaussians": summary["joint"]["gaussians"] - summary["sequential"]["gaussians"],
-        "test_psnr": summary["joint"]["test_psnr"] - summary["sequential"]["test_psnr"],
-        "test_ssim": summary["joint"]["test_ssim"] - summary["sequential"]["test_ssim"],
-        "test_important_psnr": (
-            summary["joint"]["test_important_psnr"]
-            - summary["sequential"]["test_important_psnr"]
-        ),
-        "test_normal_psnr": (
-            summary["joint"]["test_normal_psnr"]
-            - summary["sequential"]["test_normal_psnr"]
-        ),
-        "mean_iou": summary["joint"]["mean_iou"] - summary["sequential"]["mean_iou"],
-        "mean_boundary_iou": (
-            summary["joint"]["mean_boundary_iou"]
-            - summary["sequential"]["mean_boundary_iou"]
-        ),
-        "important_mean_iou": (
-            summary["joint"]["important_mean_iou"]
-            - summary["sequential"]["important_mean_iou"]
-        ),
-        "normal_mean_iou": (
-            summary["joint"]["normal_mean_iou"]
-            - summary["sequential"]["normal_mean_iou"]
-        ),
-    }
-    summary_path = output_root / "comparison.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if len(results) == 2:
+        summary["delta"] = {
+            key: summary["joint"][key] - summary["sequential"][key]
+            for key in (
+                "gaussians", "test_psnr", "test_ssim", "test_important_psnr",
+                "test_normal_psnr", "mean_iou", "mean_boundary_iou",
+                "important_mean_iou", "normal_mean_iou",
+            ) if key in summary["joint"] and key in summary["sequential"]
+        }
+        summary_path = output_root / "comparison.json"
+    else:
+        summary["partial_evaluation"] = True
+        summary_path = output_root / f"comparison_{next(iter(results))}.json"
+    save_json(summary_path, summary)
     print(json.dumps(summary, indent=2))
     print(f"Saved comparison to {summary_path}")
 
