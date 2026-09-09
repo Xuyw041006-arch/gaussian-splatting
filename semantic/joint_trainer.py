@@ -324,7 +324,7 @@ class JointSemanticSupervisor:
                 camera, self.gaussians, self.pipeline, self.background,
                 override_color=torch.ones_like(language[:, :3]), **render_options,
             )["render"][:1]
-            coverage = alpha[0].detach() >= self.args.semantic_min_alpha
+            coverage = alpha[0].detach() >= max(float(self.args.semantic_min_alpha), 1e-4)
             active = valid & coverage & (weights > 0)
             if not active.any():
                 return None
@@ -423,11 +423,16 @@ class JointSemanticSupervisor:
         expected = "v5" if self.v5 else "legacy"
         if state.get("semantic_protocol", "legacy") != expected:
             raise ValueError("Cannot resume a different semantic protocol; use a separate v5 run directory")
+        if self.v5 and (
+            state.get("language_dimensions") != self.dimensions
+            or state.get("affinity_dimensions") != self.affinity_dimensions
+        ):
+            raise ValueError("V5 language/affinity channel layout differs from checkpoint")
         if "scale_gate" in state:
             self.scale_gate.load_state_dict(state["scale_gate"])
         if "gate_optimizer" in state:
             self.gate_optimizer.load_state_dict(state["gate_optimizer"])
-        print("Restored joint semantic scale-gate checkpoint")
+        print(f"Restored joint semantic supervisor checkpoint ({expected})")
 
     def save(self, iteration):
         output = (
@@ -468,7 +473,6 @@ class JointSemanticSupervisor:
         if self.v5:
             artifact.update({
                 "version": 5, "semantic_protocol": "v5",
-                "features": torch.sigmoid(self.gaussians._semantic_features[:, :self.dimensions]).detach().half().cpu(),
                 "affinity_features": normalize_affinity_groups(self.gaussians._semantic_features[:, self.dimensions:]).detach().half().cpu(),
                 "affinity_prefix_dimensions": affinity_prefix_dimensions(self.affinity_dimensions),
                 "affinity_level_order": ("coarse", "middle", "fine"),

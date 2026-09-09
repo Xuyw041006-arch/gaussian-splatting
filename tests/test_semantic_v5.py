@@ -265,6 +265,14 @@ class V5TrainingIntegrationTests(unittest.TestCase):
             self.compute(8)
         self.assertEqual((self.camera.image_height, self.camera.image_width), (30, 40))
 
+    def test_checkpoint_cannot_mix_legacy_protocol_or_channel_layout(self):
+        with self.assertRaisesRegex(ValueError, "different semantic protocol"):
+            self.supervisor.restore_checkpoint_state({"semantic_protocol": "legacy"})
+        with self.assertRaisesRegex(ValueError, "channel layout"):
+            self.supervisor.restore_checkpoint_state({
+                "semantic_protocol": "v5", "language_dimensions": 4, "affinity_dimensions": 5,
+            })
+
 
 if __name__ == "__main__":
     unittest.main()

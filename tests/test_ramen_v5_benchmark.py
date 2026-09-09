@@ -1,4 +1,5 @@
 import contextlib
+import importlib.util
 import io
 import json
 import sys
@@ -8,7 +9,12 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import run_ramen_benchmark as benchmark
-from tests import test_ramen_resume
+# Avoid accidentally importing a third-party site-packages/tests package.
+_helper_spec = importlib.util.spec_from_file_location(
+    "local_ramen_resume_helpers", Path(__file__).with_name("test_ramen_resume.py")
+)
+test_ramen_resume = importlib.util.module_from_spec(_helper_spec)
+_helper_spec.loader.exec_module(test_ramen_resume)
 
 
 class RamenV5BenchmarkTests(unittest.TestCase):
@@ -24,6 +30,7 @@ class RamenV5BenchmarkTests(unittest.TestCase):
                 benchmark, "run", helper._fake_run(commands)
             ), mock.patch.object(benchmark, "detail_preprocessing_complete", return_value=True), mock.patch(
                 "scripts.run_ramen_recovery.establish_semantic_reference"
+            ), mock.patch.object(benchmark, "establish_v5_teacher_files"
             ), contextlib.redirect_stdout(io.StringIO()):
                 benchmark.main()
             joint, rgb = [command for command in commands if any(x.endswith("/train.py") for x in command)]
@@ -38,6 +45,13 @@ class RamenV5BenchmarkTests(unittest.TestCase):
             result = json.loads((root / "out" / "comparison.json").read_text())
             self.assertEqual(result["protocol"]["baseline_definition"], "uniform_RGB_then_posthoc_semantics")
             self.assertFalse(result["protocol"]["equal_wall_clock"])
+            train = set((scene / "sparse/0/train.txt").read_text().splitlines())
+            validation = set((scene / "sparse/0/val.txt").read_text().splitlines())
+            test = set((scene / "sparse/0/test.txt").read_text().splitlines())
+            expected = {path.name for path in (scene / "images_train").iterdir()}
+            self.assertEqual(train, expected - validation - test)
+            self.assertFalse(train & validation or train & test)
+            self.assertEqual(len(train), 2)
 
     def test_v5_cannot_reuse_unrecorded_legacy_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -50,6 +64,62 @@ class RamenV5BenchmarkTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     benchmark.main()
+
+    @unittest.skipUnless(importlib.util.find_spec("numpy"), "numpy needed for teacher cache tests")
+    def test_v5_cache_checks_every_map_and_exact_teacher_configuration(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as directory:
+            scene = Path(directory)
+            (scene / "semantic_maps").mkdir()
+            names = ["a.jpg", "b.jpg", "val.jpg"]
+            metadata = {
+                "teacher_preprocessing_version": np.array(2), "hierarchy_method": np.array("containment"),
+                "prototype_mode": np.array("off"), "prototype_features": np.zeros((1, 3)),
+                "pca_components": np.zeros((3, 8)), "fit_image_names": np.array(names[:2]),
+                "heldout_image_names": np.array(names[2:]),
+            }
+            payload = {"features": np.zeros((3, 2, 4)), "detail_weight": np.ones((2, 4)),
+                       "boundary": np.zeros((2, 4)), "thinness": np.zeros((2, 4)),
+                       "prototype_ids": np.full((2, 4), -1), "region_ids": np.zeros((2, 4)),
+                       "hierarchy_prototype_ids": np.full((3, 2, 4), -1),
+                       "hierarchy_region_ids": np.zeros((3, 2, 4))}
+            np.savez(scene / "semantic_meta.npz", **metadata)
+            for name in names:
+                np.savez(scene / "semantic_maps" / f"{Path(name).stem}.npz", **payload)
+            kwargs = dict(heldout_names=["val.jpg"], teacher_version=2, feature_dim=3,
+                          feature_width=4, image_names=names)
+            self.assertTrue(benchmark.detail_preprocessing_complete(scene, **kwargs))
+            for key, wrong in (("prototype_mode", "conservative"), ("hierarchy_method", "area"),
+                               ("teacher_preprocessing_version", 1)):
+                np.savez(scene / "semantic_meta.npz", **{**metadata, key: np.array(wrong)})
+                self.assertFalse(benchmark.detail_preprocessing_complete(scene, **kwargs))
+            np.savez(scene / "semantic_meta.npz", **metadata)
+            self.assertFalse(benchmark.detail_preprocessing_complete(scene, **{**kwargs, "feature_dim": 4}))
+            np.savez(scene / "semantic_maps/val.npz", **{**payload, "features": np.zeros((3, 2, 5))})
+            self.assertFalse(benchmark.detail_preprocessing_complete(scene, **kwargs))
+            (scene / "semantic_maps/val.npz").unlink()
+            self.assertFalse(benchmark.detail_preprocessing_complete(scene, **kwargs))
+
+    def test_map_manifest_detects_modified_missing_and_unrecorded_teacher_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scene, output = Path(directory) / "scene", Path(directory) / "out"
+            (scene / "semantic_maps").mkdir(parents=True)
+            output.mkdir()
+            for name in ("a", "val"):
+                (scene / "semantic_maps" / f"{name}.npz").write_bytes(name.encode())
+            names = ["a.jpg", "val.jpg"]
+            with self.assertRaises(RuntimeError):
+                benchmark.establish_v5_teacher_files(scene, output, names, existing_weights=True)
+            first = benchmark.establish_v5_teacher_files(scene, output, names)
+            again = benchmark.establish_v5_teacher_files(scene, output, names, existing_weights=True)
+            self.assertEqual(first, again)
+            (scene / "semantic_maps/val.npz").write_bytes(b"changed")
+            with self.assertRaises(RuntimeError):
+                benchmark.establish_v5_teacher_files(scene, output, names, existing_weights=True)
+            (scene / "semantic_maps/val.npz").unlink()
+            with self.assertRaises(RuntimeError):
+                benchmark.establish_v5_teacher_files(scene, output, names, existing_weights=True)
 
 
 if __name__ == "__main__":

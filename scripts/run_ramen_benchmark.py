@@ -1,6 +1,7 @@
 """Reproducible sequential-vs-joint benchmark on LERF-Mask ramen."""
 
 import argparse
+import hashlib
 import json
 import math
 import subprocess
@@ -164,11 +165,16 @@ def semantic_time_budget_complete(model, iteration, target):
     ) >= int(target)
 
 
-def detail_preprocessing_complete(scene, heldout_names=None, teacher_version=None):
+def detail_preprocessing_complete(scene, heldout_names=None, teacher_version=None,
+                                  feature_dim=None, feature_width=None, image_names=None):
     meta_path = Path(scene) / "semantic_meta.npz"
     maps = sorted((Path(scene) / "semantic_maps").glob("*.npz"))
     if not meta_path.is_file() or not maps:
         return False
+    if image_names is not None:
+        required_stems = {Path(name).stem for name in image_names}
+        if len(required_stems) != len(image_names) or {path.stem for path in maps} != required_stems:
+            return False
     try:
         import numpy as np
         with np.load(meta_path) as meta:
@@ -176,6 +182,11 @@ def detail_preprocessing_complete(scene, heldout_names=None, teacher_version=Non
                 "teacher_preprocessing_version" not in meta.files
                 or int(meta["teacher_preprocessing_version"]) != teacher_version
                 or str(meta.get("hierarchy_method", "")) != "containment"
+                or str(meta.get("prototype_mode", "")) != "off"
+            ):
+                return False
+            if feature_dim is not None and (
+                "pca_components" not in meta.files or meta["pca_components"].shape[0] != feature_dim
             ):
                 return False
             if "prototype_features" not in meta.files:
@@ -188,15 +199,56 @@ def detail_preprocessing_complete(scene, heldout_names=None, teacher_version=Non
                     return False
                 if expected.intersection(meta["fit_image_names"].tolist()):
                     return False
-        with np.load(maps[0]) as semantic_map:
-            required = {
-                "detail_weight", "boundary", "thinness", "prototype_ids",
-                "hierarchy_prototype_ids", "region_ids",
-                "hierarchy_region_ids",
-            }
-            return required.issubset(semantic_map.files)
-    except (OSError, ValueError):
+                if image_names is not None and set(meta["fit_image_names"].tolist()) != set(image_names) - expected:
+                    return False
+        for path in maps if teacher_version is not None else maps[:1]:
+            with np.load(path) as semantic_map:
+                required = {
+                    "detail_weight", "boundary", "thinness", "prototype_ids",
+                    "hierarchy_prototype_ids", "region_ids", "hierarchy_region_ids",
+                }
+                if not required.issubset(semantic_map.files):
+                    return False
+                if feature_dim is not None or feature_width is not None:
+                    if "features" not in semantic_map.files:
+                        return False
+                    shape = semantic_map["features"].shape
+                    if len(shape) != 3 or (feature_dim is not None and shape[0] != feature_dim) or (feature_width is not None and shape[2] != feature_width):
+                        return False
+                    if semantic_map["region_ids"].shape != shape[1:] or semantic_map["hierarchy_region_ids"].shape != (3, *shape[1:]):
+                        return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def establish_v5_teacher_files(scene, output_root, image_names, existing_weights=False):
+    """Freeze every required teacher map, not only the PCA coordinate system."""
+    scene, output_root = Path(scene), Path(output_root)
+    entries = {}
+    for name in sorted(image_names):
+        relative = f"semantic_maps/{Path(name).stem}.npz"
+        path = scene / relative
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"Missing or non-regular V5 teacher map: {path}")
+        stamp = (path.stat().st_size, path.stat().st_mtime_ns)
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        if stamp != (path.stat().st_size, path.stat().st_mtime_ns):
+            raise RuntimeError(f"Teacher changed during fingerprinting: {path}")
+        entries[relative] = {"bytes": stamp[0], "sha256": digest.hexdigest()}
+    payload = {"version": 1, "image_names": sorted(image_names), "files": entries}
+    manifest = output_root / "v5_teacher_files.json"
+    if manifest.exists():
+        if load_json(manifest, None) != payload:
+            raise RuntimeError("V5 teacher maps or image identities changed; preserve weights and use the original frozen teacher or a new output_root")
+    elif existing_weights:
+        raise RuntimeError("Existing V5 weights lack a complete teacher-file manifest; safe map compatibility cannot be established")
+    else:
+        save_json(manifest, payload)
+    return payload
 
 
 def main():
@@ -275,6 +327,8 @@ def main():
         "validation_views": args.validation_views,
     }
     if args.semantic_protocol == "v5":
+        requested_protocol.update(teacher_preprocessing_version=2, hierarchy_method="containment",
+                                  prototype_mode="off", sam_crop_n_layers=args.sam_crop_n_layers)
         existing_weights = list(output_root.glob("*/chkpnt*.pth")) + list(output_root.glob("*/point_cloud/iteration_*/*.ply"))
         if existing_weights and recorded_protocol != requested_protocol:
             parser.error("V5 cannot reuse unrecorded or different-protocol weights; choose a new output_root")
@@ -293,6 +347,10 @@ def main():
     training_images = sorted(
         path for path in training_image_dir.glob("*.*") if path.is_file()
     )
+    test_names = {path.name for path in test_images}
+    if args.semantic_protocol == "v5" and any(path.name in test_names for path in training_images):
+        parser.error("V5 images_train contains official test images; use an isolated train/validation image folder")
+    training_images = [path for path in training_images if path.name not in test_names]
     if len(training_images) < 3:
         training_images = sorted(
             path for path in (scene / "images").glob("*.*")
@@ -308,10 +366,17 @@ def main():
         "".join(f"{path.name}\n" for path in validation_images), encoding="utf-8"
     )
     print("Validation views:", [path.name for path in validation_images])
+    validation_names = {path.name for path in validation_images}
+    fit_images = [path for path in training_images if path.name not in validation_names | test_names]
+    train_file = scene / "sparse" / "0" / "train.txt"
+    train_file.write_text("".join(f"{path.name}\n" for path in fit_images), encoding="utf-8")
+    print("Training view count:", len(fit_images))
 
     preprocessed = detail_preprocessing_complete(
         scene, [p.name for p in validation_images],
         teacher_version=2 if args.semantic_protocol == "v5" else None,
+        **({"feature_dim": args.feature_dim, "feature_width": args.feature_width,
+            "image_names": [path.name for path in training_images]} if args.semantic_protocol == "v5" else {}),
     )
     if args.semantic_protocol == "v5" and args.skip_preprocess and not preprocessed:
         parser.error("V5 --skip_preprocess requires completed version-2 train-only containment teachers")
@@ -338,6 +403,13 @@ def main():
 
     if args.semantic_protocol == "v5":
         from scripts.run_ramen_recovery import establish_semantic_reference
+        if not detail_preprocessing_complete(
+            scene, [path.name for path in validation_images], teacher_version=2,
+            feature_dim=args.feature_dim, feature_width=args.feature_width,
+            image_names=[path.name for path in training_images],
+        ):
+            parser.error("V5 teacher output is incomplete or has mismatched configuration/dimensions")
+        establish_v5_teacher_files(scene, output_root, [path.name for path in training_images], bool(existing_weights))
         establish_semantic_reference(scene, output_root / "teacher_reference", output_root)
 
     if args.prepare_only:
