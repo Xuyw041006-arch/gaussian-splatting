@@ -291,3 +291,37 @@ alpha 归一亲和像素评分；调用者先核验模型签名，并保持其�
 即使能够构库，也只能验证流程，不能证明亲和已学好或分割有所提升。真实质量
 还须新 v5 完整训练后在固定 annotated 测试集按独立协议测量，并额外报告构库
 时间、库大小和检索时间；不能隐去这一后处理成本。
+
+## 9. Colab 完整实验与恢复快照
+
+先在独立目录运行 `scripts.run_ramen_benchmark --semantic_protocol v5 --prepare_only`
+完成 131 个候选视角教师处理。确认 `v5_teacher_files.json` 完整后，可以启动固定配置：
+
+```bash
+python -u -m scripts.run_v5_monitored_benchmark \
+  --scene /content/ramen_semantic_v5/data/ramen \
+  --sam_checkpoint /content/ramen_recoverable_cache/ramen_detail_v2_15k/assets/sam_vit_h_4b8939.pth \
+  --output_root /content/ramen_semantic_v5/outputs_full \
+  --snapshot_dir /content/drive/MyDrive/semantic_adaptive_3dgs/ramen_v5_live_snapshot \
+  --snapshot_seconds 120
+```
+
+这个入口先验证并备份完整教师，再依次执行联合模型、顺序 RGB+语义基线、统一检索
+计分、独立描述符库计分和报告。训练上限 15000，RGB 预热 2500，语义渐增 2000，
+12 验证视角、每 1000 步验证并存 checkpoint。所有恢复经过已有 `--resume`；
+输出目录不复用旧实验。状态在 `outputs_full/monitored_state.json`，每阶段日志为
+`session_*.log`。已有状态的 Git commit 不一致时拒绝恢复，不要在运行中更新代码。
+
+`snapshot_v5_progress.py` 使用独占目录标记、文件锁、SHA 读回、checkpoint ZIP 校验、
+临时文件原子替换与空间预检，只维护本次实验的恢复快照。它不删除旧模型/数据，
+空间不足保留上次有效备份并发出警告。初次完整教师备份失败不会启动训练；训练中
+备份失败则保留本地进度，状态明确标注。备份间隔是检查周期，不是每两分钟必有新权重。
+
+周期快照不等于完整最终工件归档，也不包含原始 RGB 数据集。恢复应核对清单和源代码
+版本，语义顺序阶段必须使用清单绑定的 RGB PLY，不能搭配另一份几何。最终计算与
+备份状态分开记录；只有 `computation_complete` 为真且结果文件齐全才能说计算完成。
+Colab 限时/断连不会被这个脚本绕过；远端快照可减小损失，但不能保证云运行时无限持续。
+
+历史二值 mask 可用 `scripts.score_saved_lerf_masks` 在 CPU 上按 GG-native 重计分。
+它不重推理、不改阈值、不改原预测，输出到新的 JSON。这一步用于区分计分变化和
+检索改进，不能据此声称模型重新训练提升。
