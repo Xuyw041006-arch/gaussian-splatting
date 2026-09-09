@@ -266,6 +266,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += joint_result["loss"]
 
         loss.backward()
+        if joint is not None and getattr(joint_args, "semantic_protocol", "legacy") == "v5" and iteration % 100 == 0:
+            # Small auditable diagnostics, independent of TensorBoard. A finite
+            # total loss alone does not prove the independent fields learned.
+            with torch.no_grad():
+                gradient = gaussians._semantic_features.grad
+                record = {"iteration": iteration, "gaussians": len(gaussians.get_xyz),
+                          "total_loss": float(loss.detach()), "rgb_l1": float(Ll1.detach()),
+                          "semantic_active": joint_result is not None}
+                if joint_result is not None:
+                    for name in ("data_loss", "boundary_loss", "clip_cosine_loss", "affinity_loss"):
+                        record[name] = float(joint_result[name])
+                    record["phase"] = joint_result["phase"]
+                    record["affinity_stats"] = joint_result["affinity_stats"]
+                for name, part in (("language", slice(None, joint.dimensions)),
+                                   ("affinity", slice(joint.dimensions, None))):
+                    values = gradient[:, part] if gradient is not None else None
+                    record[name + "_gradient_finite"] = bool(torch.isfinite(values).all()) if values is not None else None
+                    record[name + "_gradient_norm"] = float(values.norm()) if values is not None else None
+                with open(os.path.join(scene.model_path, "semantic_training_diagnostics.jsonl"), "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record) + "\n")
         if joint_capacity_active:
             gaussians.mask_sh_gradients(*joint_args.tier_sh_degrees)
 

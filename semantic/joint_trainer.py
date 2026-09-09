@@ -1,6 +1,7 @@
 """Runtime for joint RGB reconstruction and hierarchical semantic distillation."""
 
 import os
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from semantic.v5 import (
     normalize_rendered_features, region_balance_weights,
 )
 from semantic.joint import (
+    symmetric_importance_ema,
     ScaleGate,
     boundary_alignment_loss,
     granularity_for_step,
@@ -28,6 +30,28 @@ from semantic.joint import (
     select_region_ids,
     tier_weights,
 )
+
+
+@lru_cache(maxsize=256)
+def load_v5_importance_observations(path):
+    """Read lightweight tier evidence only; unknown pixels are not observations.
+
+    Loading NPZ members separately avoids decompressing CLIP feature tensors.
+    NaNs are intentionally retained by the symmetric EMA as no-update markers.
+    """
+    with np.load(path) as data:
+        if "importance" not in data.files or "importance_known" not in data.files:
+            raise ValueError("V5 requires competitive importance_known evidence maps; regenerate in a new scene directory")
+        tiers = data["importance"].astype(np.float32)
+        evidence = data["importance_known"]
+        if not np.isin(evidence, [0, 1]).all():
+            raise ValueError("V5 importance_known must be a binary evidence mask")
+        known = evidence.astype(bool)
+    if tiers.ndim != 2 or known.shape != tiers.shape:
+        raise ValueError("V5 importance tiers and evidence mask must have the same 2D shape")
+    if not np.isin(tiers, [0, 1, 2]).all():
+        raise ValueError("V5 importance tiers must be 0, 1, or 2")
+    return np.where(known, tiers, np.nan).astype(np.float32)
 
 
 class JointSemanticSupervisor:
@@ -52,6 +76,13 @@ class JointSemanticSupervisor:
             self.meta = {key: loaded[key].copy() for key in loaded.files}
         self.dimensions = int(self.meta["pca_components"].shape[0])
         self.v5 = getattr(args, "semantic_protocol", "legacy") == "v5"
+        if self.v5 and (
+            int(self.meta.get("teacher_preprocessing_version", 0)) != 2
+            or str(self.meta.get("hierarchy_method", "")) != "containment"
+            or str(self.meta.get("prototype_mode", "")) != "off"
+            or str(self.meta.get("importance_policy", "")) != "competitive_v1"
+        ):
+            raise ValueError("V5 requires a new containment teacher with prototype_mode=off and competitive_v1 importance; do not reuse legacy maps")
         self.affinity_dimensions = int(getattr(args, "affinity_dimensions", 16)) if self.v5 else 0
         already_initialized = gaussians.has_joint_semantics
         gaussians.setup_joint_semantics(
@@ -98,16 +129,29 @@ class JointSemanticSupervisor:
     @torch.no_grad()
     def observe_importance(self, camera, visible_indices):
         """Fuse tier evidence from every RGB iteration, including semantic warmup."""
-        path = self.importance_path(camera)
+        path = self.map_path(camera) if self.v5 else self.importance_path(camera)
         if not path.is_file():
             return
-        tiers = load_importance_tiers(str(path)).cuda(non_blocking=True)
+        tiers = (
+            torch.from_numpy(load_v5_importance_observations(str(path)))
+            if self.v5 else load_importance_tiers(str(path))
+        ).cuda(non_blocking=True)
         indices, observations = project_tiers_to_gaussians(
             self.gaussians.get_xyz, camera, tiers, visible_indices
         )
-        self.gaussians.update_importance_score(
-            indices, observations, self.args.importance_ema
-        )
+        if self.v5:
+            # Uncovered/ambiguous pixels carry no semantic evidence. In-frame
+            # position is not enough to justify changing the persistent tier.
+            known = torch.isfinite(observations)
+            indices, observations = indices[known], observations[known]
+            if not indices.numel():
+                return
+            previous = self.gaussians.importance_score[indices]
+            self.gaussians.importance_score[indices] = symmetric_importance_ema(
+                previous, observations.reshape(-1).to(previous), self.args.importance_ema,
+            )
+        else:
+            self.gaussians.update_importance_score(indices, observations, self.args.importance_ema)
 
     def compute(self, camera, iteration, validation=False):
         """Distill sampled training channels or evaluate all channels at middle scale.

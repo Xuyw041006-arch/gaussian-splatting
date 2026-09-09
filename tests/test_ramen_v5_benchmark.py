@@ -52,6 +52,32 @@ class RamenV5BenchmarkTests(unittest.TestCase):
             self.assertEqual(train, expected - validation - test)
             self.assertFalse(train & validation or train & test)
             self.assertEqual(len(train), 2)
+            protocol = json.loads((root / "out" / "experiment_protocol.json").read_text())
+            self.assertEqual(protocol["importance_policy"], "competitive_v1")
+            self.assertEqual(protocol["background_prompts"], "table,wall")
+
+    def test_competitive_preprocessing_arguments_only_apply_to_v5(self):
+        helper = test_ramen_resume.RamenResumeTests()
+        for protocol in ("v5", "legacy"):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                scene = helper._scene(root)
+                commands = []
+                argv = ["benchmark", "--scene", str(scene), "--sam_checkpoint", "unused",
+                        "--output_root", str(root / "out"), "--semantic_protocol", protocol, "--prepare_only"]
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                    benchmark, "run", helper._fake_run(commands)
+                ), mock.patch.object(benchmark, "detail_preprocessing_complete", return_value=True), mock.patch(
+                    "scripts.run_ramen_recovery.establish_semantic_reference"
+                ), mock.patch.object(benchmark, "establish_v5_teacher_files"), contextlib.redirect_stdout(io.StringIO()):
+                    benchmark.main()
+                preprocess = commands[0]
+                if protocol == "v5":
+                    self.assertEqual(preprocess[preprocess.index("--importance_policy") + 1], "competitive_v1")
+                    self.assertEqual(preprocess[preprocess.index("--background") + 1], benchmark.BACKGROUND)
+                else:
+                    self.assertNotIn("--importance_policy", preprocess)
+                    self.assertNotIn("--background", preprocess)
 
     def test_v5_cannot_reuse_unrecorded_legacy_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -76,12 +102,14 @@ class RamenV5BenchmarkTests(unittest.TestCase):
             metadata = {
                 "teacher_preprocessing_version": np.array(2), "hierarchy_method": np.array("containment"),
                 "prototype_mode": np.array("off"), "prototype_features": np.zeros((1, 3)),
+                "importance_policy": np.array("competitive_v1"),
                 "pca_components": np.zeros((3, 8)), "fit_image_names": np.array(names[:2]),
                 "heldout_image_names": np.array(names[2:]),
             }
             payload = {"features": np.zeros((3, 2, 4)), "detail_weight": np.ones((2, 4)),
                        "boundary": np.zeros((2, 4)), "thinness": np.zeros((2, 4)),
                        "prototype_ids": np.full((2, 4), -1), "region_ids": np.zeros((2, 4)),
+                       "importance": np.ones((2, 4)), "importance_known": np.ones((2, 4)),
                        "hierarchy_prototype_ids": np.full((3, 2, 4), -1),
                        "hierarchy_region_ids": np.zeros((3, 2, 4))}
             np.savez(scene / "semantic_meta.npz", **metadata)
@@ -90,7 +118,13 @@ class RamenV5BenchmarkTests(unittest.TestCase):
             kwargs = dict(heldout_names=["val.jpg"], teacher_version=2, feature_dim=3,
                           feature_width=4, image_names=names)
             self.assertTrue(benchmark.detail_preprocessing_complete(scene, **kwargs))
+            np.savez(scene / "semantic_maps/a.npz", **{k: v for k, v in payload.items() if k != "importance_known"})
+            self.assertFalse(benchmark.detail_preprocessing_complete(scene, **kwargs))
+            np.savez(scene / "semantic_maps/a.npz", **{**payload, "importance": np.ones((1, 4)), "importance_known": np.ones((1, 4))})
+            self.assertFalse(benchmark.detail_preprocessing_complete(scene, **kwargs))
+            np.savez(scene / "semantic_maps/a.npz", **payload)
             for key, wrong in (("prototype_mode", "conservative"), ("hierarchy_method", "area"),
+                               ("importance_policy", "legacy"),
                                ("teacher_preprocessing_version", 1)):
                 np.savez(scene / "semantic_meta.npz", **{**metadata, key: np.array(wrong)})
                 self.assertFalse(benchmark.detail_preprocessing_complete(scene, **kwargs))

@@ -1,5 +1,6 @@
 """Extract SAM regions, CLIP semantics, PCA maps, and importance masks."""
 
+import hashlib
 import json
 import os
 from argparse import ArgumentParser
@@ -16,6 +17,76 @@ from semantic.inventory import (
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+IMPORTANCE_NEGATIVE_PROMPTS = ("object", "things", "stuff", "texture")
+COMPETITIVE_IMPORTANCE_DEFAULTS = {
+    "min_cosine": 0.25, "min_relevancy": 0.60, "min_margin": 0.04,
+    "temperature": 10.0, "max_important_area": 0.80,
+}
+
+
+def validate_importance_prompts(tiers):
+    """Deduplicate labels and reject contradictory user/LLM tier assignments."""
+    normalized = {tier: sorted({normalize_label(label) for label in tiers.get(tier, [])
+                                if normalize_label(label)})
+                  for tier in ("background", "normal", "important")}
+    owners = {}
+    for tier, labels in normalized.items():
+        for label in labels:
+            if label in owners:
+                raise ValueError(f"Importance label {label!r} occurs in both {owners[label]} and {tier}")
+            owners[label] = tier
+    return normalized
+
+
+def importance_policy_fingerprint(configuration):
+    serialized = json.dumps(configuration, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def competitive_importance(features, tier_text, negative_text, area_ratios, **overrides):
+    """Conservative tier decisions from raw normalized CLIP, not SAM quality.
+
+    Relevancy is a contrastive score, NOT a calibrated correctness probability.
+    No feature array is modified; unknowns and competing matches stay normal.
+    """
+    config = {**COMPETITIVE_IMPORTANCE_DEFAULTS, **overrides}
+    features = np.asarray(features)
+    count = len(features)
+    scores = np.full((count, 3), -1.0, dtype=np.float32)
+    available = np.zeros(3, dtype=bool)
+    for tier_id, tier in enumerate(("background", "normal", "important")):
+        text = tier_text.get(tier)
+        if text is not None and len(text):
+            values = features @ np.asarray(text).T
+            scores[:, tier_id] = np.max(np.where(np.isfinite(values), values, -1.0), axis=1)
+            available[tier_id] = True
+    if negative_text is None or not len(negative_text):
+        raise ValueError("competitive importance requires explicit generic negative descriptors")
+    negative_values = features @ np.asarray(negative_text).T
+    negative_scores = np.max(np.where(np.isfinite(negative_values), negative_values, 1.0), axis=1)
+    relevancy = 1.0 / (1.0 + np.exp(np.clip(
+        -config["temperature"] * (scores - negative_scores[:, None]), -80, 80)))
+    margins = np.stack([scores[:, i] - np.max(scores[:, [j for j in range(3) if j != i]], axis=1)
+                        for i in range(3)], axis=1)
+    finite = np.isfinite(features).all(axis=1) & (np.linalg.norm(features, axis=1) > 1e-8)
+    supported = (available[None, :] & finite[:, None]
+                 & (scores >= config["min_cosine"])
+                 & (relevancy >= config["min_relevancy"])
+                 & (margins >= config["min_margin"]))
+    tiers = np.ones(count, dtype=np.uint8)
+    reasons = np.full(count, "normal_unconfirmed", dtype="U32")
+    reasons[supported[:, 1]] = "normal_supported"
+    near_tie = ((scores.max(axis=1) >= config["min_cosine"])
+                & (margins.max(axis=1) < config["min_margin"]))
+    reasons[near_tie] = "normal_ambiguous"
+    large = np.asarray(area_ratios) >= config["max_important_area"]
+    reasons[supported[:, 2] & large] = "normal_large_region"
+    for tier_id, reason in ((0, "background_supported"), (2, "important_supported")):
+        selected = supported[:, tier_id] & (~large if tier_id == 2 else True)
+        tiers[selected], reasons[selected] = tier_id, reason
+    reasons[~finite] = "normal_invalid_features"
+    return {"tiers": tiers, "scores": scores, "margins": margins,
+            "relevancy": relevancy.astype(np.float32), "reasons": reasons}
 
 
 def image_files(directory):
@@ -271,6 +342,7 @@ def _expand_binary(mask, iterations):
 def build_detail_supervision(
     region_map, importance, boundary_width=2, boundary_boost=1.75,
     thin_boost=1.25, thin_compactness=0.35, thin_aspect_ratio=3.0,
+    promote_importance=True,
 ):
     """Create boundary/thin-object weights and promote their densification tier.
 
@@ -318,13 +390,15 @@ def build_detail_supervision(
             score = float(max(compactness_score, aspect_score))
         if score > 0:
             thinness[mask] = score
-            enhanced[mask] = np.maximum(enhanced[mask], 1)
+            if promote_importance:
+                enhanced[mask] = np.maximum(enhanced[mask], 1)
 
     # Preserve both sides of meaningful object boundaries.  Important-object
     # boundaries remain tier 2; other SAM boundaries become at least tier 1.
     important_nearby = _expand_binary(importance >= 2, boundary_width) & boundary
-    enhanced[boundary] = np.maximum(enhanced[boundary], 1)
-    enhanced[important_nearby] = 2
+    if promote_importance:
+        enhanced[boundary] = np.maximum(enhanced[boundary], 1)
+        enhanced[important_nearby] = 2
     tier_scale = 0.65 + 0.175 * enhanced.astype(np.float32)
     detail_weight = (
         1.0
@@ -420,11 +494,14 @@ def main():
         help="User/LLM scene inventory JSON with background/normal/important tiers",
     )
     parser.add_argument("--normal", default="", help="Normal-priority object prompts")
+    parser.add_argument("--background", default="", help="Explicit background object/material prompts; unknown pixels are not confirmed background")
     parser.add_argument(
         "--normal_json", default="",
         help="Optional JSON mapping image filename/stem to normal-priority objects",
     )
     parser.add_argument("--importance_threshold", type=float, default=0.24)
+    parser.add_argument("--importance_policy", choices=["legacy", "competitive_v1"], default="legacy",
+                        help="Competitive tiers require semantic support; ambiguous regions remain normal")
     parser.add_argument(
         "--importance_topk", type=int, default=0,
         help="Maximum above-threshold regions per prompt; 0 keeps all supported matches",
@@ -543,14 +620,14 @@ def main():
 
     prompts = parse_prompts(args.important)
     normal_prompts = parse_prompts(args.normal)
-    background_prompts = []
+    background_prompts = parse_prompts(args.background)
     selected_inventory_tiers = {}
     if args.importance_config:
         with open(args.importance_config, encoding="utf-8") as handle:
             tier_config = parse_inventory_config(json.load(handle))
         prompts = sorted(set(prompts + tier_config["important"]))
         normal_prompts = sorted(set(normal_prompts + tier_config["normal"]))
-        background_prompts = tier_config["background"]
+        background_prompts = sorted(set(background_prompts + tier_config["background"]))
         selected_inventory_tiers = {
             label: tier for tier, labels in tier_config.items() for label in labels
         }
@@ -593,6 +670,14 @@ def main():
     all_features = []
     records = []
     for path in tqdm(paths, desc="SAM + CLIP"):
+        normal_mapping = normal_prompt_map if normal_prompt_map else prompt_map
+        current_tier_prompts = {
+            "important": prompts_for(prompt_map, path, prompts, "important"),
+            "normal": prompts_for(normal_mapping, path, normal_prompts, "normal"),
+            "background": background_prompts,
+        }
+        if args.importance_policy == "competitive_v1":
+            current_tier_prompts = validate_importance_prompts(current_tier_prompts)
         rgb = np.asarray(Image.open(path).convert("RGB"))
         regions = generator.generate(rgb)
         regions = [region for region in regions if region["area"] >= args.min_mask_area]
@@ -641,7 +726,6 @@ def main():
             ),
         )
         all_features.append(features)
-        normal_mapping = normal_prompt_map if normal_prompt_map else prompt_map
         records.append({
             "path": path,
             "raw_path": raw_path,
@@ -651,11 +735,9 @@ def main():
                 [region["area"] / (rgb.shape[0] * rgb.shape[1]) for region in regions],
                 dtype=np.float32,
             ),
-            "important_prompts": prompts_for(prompt_map, path, prompts, "important"),
-            "normal_prompts": prompts_for(
-                normal_mapping, path, normal_prompts, "normal"
-            ),
-            "background_prompts": background_prompts,
+            "important_prompts": current_tier_prompts["important"],
+            "normal_prompts": current_tier_prompts["normal"],
+            "background_prompts": current_tier_prompts["background"],
         })
 
     stacked_raw = np.concatenate(all_features, axis=0)
@@ -723,6 +805,21 @@ def main():
     offset = 0
     confidence_values = []
     tier_counts = np.zeros(3, dtype=np.int64)
+    importance_configuration = {
+        "policy": args.importance_policy,
+        "parameters": (COMPETITIVE_IMPORTANCE_DEFAULTS if args.importance_policy == "competitive_v1"
+                       else {"threshold": args.importance_threshold, "topk": args.importance_topk,
+                             "background_area_ratio": args.background_area_ratio}),
+        "generic_negatives": list(IMPORTANCE_NEGATIVE_PROMPTS) if args.importance_policy == "competitive_v1" else [],
+        "prompts_by_image": {record["path"].name: {
+            tier: record[f"{tier}_prompts"] for tier in ("background", "normal", "important")
+        } for record in records},
+        "boundary_promotes_semantic_tier": args.importance_policy == "legacy",
+        "semantic_relevancy_is_calibrated_probability": False,
+        "confidence_field_meaning": "SAM_mask_quality_not_semantic_confidence",
+    }
+    importance_fingerprint = importance_policy_fingerprint(importance_configuration)
+    importance_reason_counts = {}
     detail_statistics = {
         "valid_pixels": 0, "boundary_pixels": 0,
         "thinness_sum": 0.0, "detail_weight_sum": 0.0,
@@ -769,33 +866,61 @@ def main():
         confidence[valid] = confidences[region_map[valid]]
         confidence_values.extend(confidences.tolist())
 
-        object_like = set(np.flatnonzero(
-            record["area_ratios"] < args.background_area_ratio
-        ).tolist())
-        normal_text = features_for_prompts(record["normal_prompts"])
-        normal_regions = (
-            select_prompt_regions(
-                record["features"], normal_text,
+        importance_diagnostics = {}
+        if args.importance_policy == "competitive_v1":
+            decision = competitive_importance(
+                record["features"],
+                {tier: features_for_prompts(record[f"{tier}_prompts"])
+                 for tier in ("background", "normal", "important")},
+                features_for_prompts(IMPORTANCE_NEGATIVE_PROMPTS), record["area_ratios"],
+            )
+            # Uncovered pixels are unknown, not positively identified background.
+            importance = np.ones(region_map.shape, dtype=np.uint8)
+            importance[valid] = decision["tiers"][region_map[valid]]
+            importance_known = np.zeros(region_map.shape, dtype=np.uint8)
+            region_known = np.isin(decision["reasons"], [
+                "background_supported", "normal_supported", "important_supported",
+            ])
+            importance_known[valid] = region_known[region_map[valid]]
+            importance_diagnostics = {
+                "importance_region_tiers": decision["tiers"],
+                "importance_region_scores": decision["scores"],
+                "importance_region_margins": decision["margins"],
+                "importance_region_relevancy": decision["relevancy"],
+                "importance_region_reasons": decision["reasons"],
+                "importance_known": importance_known,
+                "mask_quality": confidence.astype(np.float16),
+            }
+            reason_names, reason_counts = np.unique(decision["reasons"], return_counts=True)
+            for name, value in zip(reason_names, reason_counts):
+                importance_reason_counts[str(name)] = importance_reason_counts.get(str(name), 0) + int(value)
+        else:
+            object_like = set(np.flatnonzero(
+                record["area_ratios"] < args.background_area_ratio
+            ).tolist())
+            normal_text = features_for_prompts(record["normal_prompts"])
+            normal_regions = (
+                select_prompt_regions(
+                    record["features"], normal_text,
+                    args.importance_threshold, args.importance_topk,
+                ) if normal_text is not None else object_like
+            )
+            normal_regions &= object_like
+            background_regions = select_prompt_regions(
+                record["features"],
+                features_for_prompts(record["background_prompts"]),
                 args.importance_threshold, args.importance_topk,
-            ) if normal_text is not None else object_like
-        )
-        normal_regions &= object_like
-        background_regions = select_prompt_regions(
-            record["features"],
-            features_for_prompts(record["background_prompts"]),
-            args.importance_threshold, args.importance_topk,
-        )
-        normal_regions -= background_regions
-        important_regions = select_prompt_regions(
-            record["features"],
-            features_for_prompts(record["important_prompts"]),
-            args.importance_threshold,
-            args.importance_topk,
-        )
-        importance = np.zeros(region_map.shape, dtype=np.uint8)
-        importance[np.isin(region_map, list(normal_regions))] = 1
-        importance[np.isin(region_map, list(important_regions))] = 2
-        importance[np.isin(region_map, list(background_regions))] = 0
+            )
+            normal_regions -= background_regions
+            # Keep the legacy independent prompt-union behavior unchanged.
+            important_regions = select_prompt_regions(
+                record["features"], features_for_prompts(record["important_prompts"]),
+                args.importance_threshold, args.importance_topk,
+            )
+            importance = np.zeros(region_map.shape, dtype=np.uint8)
+            importance[np.isin(region_map, list(normal_regions))] = 1
+            importance[np.isin(region_map, list(important_regions))] = 2
+            importance[np.isin(region_map, list(background_regions))] = 0
         detail_weight, boundary, thinness, importance = build_detail_supervision(
             region_map, importance,
             boundary_width=args.boundary_width,
@@ -803,6 +928,7 @@ def main():
             thin_boost=args.thin_boost,
             thin_compactness=args.thin_compactness,
             thin_aspect_ratio=args.thin_aspect_ratio,
+            promote_importance=args.importance_policy == "legacy",
         )
         detail_statistics["valid_pixels"] += int(valid.sum())
         detail_statistics["boundary_pixels"] += int(boundary.sum())
@@ -848,6 +974,7 @@ def main():
             thinness=thinness.astype(np.float16),
             prototype_ids=prototype_map,
             hierarchy_prototype_ids=hierarchy_prototype_ids,
+            **importance_diagnostics,
         )
 
     np.savez(
@@ -867,6 +994,9 @@ def main():
         prototype_mode=np.asarray(args.prototype_mode),
         language_target=np.asarray("raw_CLIP_projected_training_PCA"),
         prototype_clip_features=prototype_centers.astype(np.float32),
+        importance_policy=np.asarray(args.importance_policy),
+        importance_policy_fingerprint=np.asarray(importance_fingerprint),
+        importance_policy_json=np.asarray(json.dumps(importance_configuration, sort_keys=True)),
     )
     summary = {
         "images": len(paths), "regions": int(stacked.shape[0]),
@@ -881,6 +1011,10 @@ def main():
         "feature_dim": dimensions, "important_prompts": prompts,
         "normal_prompts": normal_prompts,
         "background_prompts": background_prompts,
+        "importance_policy": args.importance_policy,
+        "importance_policy_fingerprint": importance_fingerprint,
+        "importance_policy_configuration": importance_configuration,
+        "importance_region_reason_counts": importance_reason_counts,
         "clip_model": args.clip_model, "clip_pretrained": args.clip_pretrained,
         "sam_model": args.sam_model,
         "teacher_preprocessing": {

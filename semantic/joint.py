@@ -11,6 +11,22 @@ from torch import nn
 GRANULARITIES = ("coarse", "middle", "fine")
 
 
+@torch.no_grad()
+def symmetric_importance_ema(previous, observations, momentum=0.9):
+    """Use equal inertia for automatic promotion and demotion, without mutation.
+
+    This is not an occlusion check or a count of independent supporting views.
+    Nonfinite observations retain the previous score instead of corrupting it.
+    """
+    if not 0.0 <= float(momentum) <= 1.0:
+        raise ValueError("importance EMA momentum must be in [0, 1]")
+    observations = torch.as_tensor(observations, dtype=previous.dtype, device=previous.device)
+    if observations.shape != previous.shape:
+        raise ValueError("importance EMA observations and previous scores must have equal shape")
+    safe = torch.where(torch.isfinite(observations), observations.clamp(0, 1), previous)
+    return (float(momentum) * previous + (1.0 - float(momentum)) * safe).clamp(0, 1)
+
+
 class ScaleGate(nn.Module):
     """SAGA-style learned channel gate conditioned on a normalized scale."""
 

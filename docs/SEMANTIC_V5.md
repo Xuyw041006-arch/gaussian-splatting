@@ -41,7 +41,7 @@ alpha 分母均参与梯度，不能仅对分母断梯度。
 | 原始 3D Gaussian Splatting | 保留可微高斯渲染、RGB 优化、clone/split/prune；重要性调节原始致密化阈值 | 没有新增五阶 SH CUDA 内核；不能把较多高斯直接当成较好精度 |
 | LangSplat / LERF | 区域 CLIP 蒸馏；还原 PCA 可重构 CLIP 空间；目标与通用负词的相关度评分 | 不是 LangSplat 的自编码器、多套语言场和完整评测后处理复现 |
 | SAGA | 语言与实例亲和目标分离；同组/异组对比；点提示亲和检索 | 没有 SAGA 的物理 3D 尺度估计、尺度分位数条件或连续尺度门控；本版只有二维包含层级 |
-| LaGa | 独立亲和字段、残差分组的粗到细表达；借鉴对象级多视角语义思路 | 尚无 per-object multiple descriptor bank、对象级自适应 K-means 和完整加权描述子相关度聚合 |
+| LaGa | 独立亲和字段、残差分组的粗到细表达；可选训练后多视角区域描述符对齐库 | 尚无官方式明确对象分解、per-object adaptive K-means 与完整对象级描述符聚合复现 |
 | Gaussian Grouping | 增加与官方 LERF-Mask 最终 mask 几何规则一致的 `gg_native` 计分选项 | 没有完整复现其实例身份场、Grounded-SAM 到 3D 实例的查询训练流程 |
 
 对应官方依据：
@@ -69,8 +69,9 @@ Ramen v5 基准使用 SAM ViT-H 与 OpenCLIP `ViT-H-14 / laion2b_s32b_b79k`。
 320 个像素，正/负 cosine margin 为 0.8/0.2，组范数正则系数 0.05。
 
 跨视角约束的当前范围：所有相机共同优化同一组 3D 特征，可产生共享一致性；
-但 v5 没有显式跨视角对象追踪、遮挡感知对应或 LaGa 描述子库，因此不能声称
-已经解决跨视角实例一致性。二维教师不可靠的部分仍可能互相冲突。
+但 v5 没有显式跨视角对象追踪、遮挡感知对应或官方 LaGa 对象库，因此不能声称
+已经解决跨视角实例一致性。二维教师不可靠的部分仍可能互相冲突。下述训练后
+区域对齐库是独立可选检索分支，不改变这一训练范围。
 
 词汇与重要性流程支持候选词表匹配生成 `scene_inventory.json`，再由用户或 LLM
 确认背景/普通/重要。SAM 只给 mask，CLIP 只在候选文本中匹配，不会自动发现
@@ -78,11 +79,19 @@ Ramen v5 基准使用 SAM ViT-H 与 OpenCLIP `ViT-H-14 / laion2b_s32b_b79k`。
 
 - 重要：`egg, pork belly, wavy noodles in bowl`。
 - 普通：`yellow bowl, chopsticks, glass of water`。
-- 背景：剩余区域；不是有人工完整背景标注的类别。
+- 背景：显式候选 `table, wall`；不是把所有未知区域都归为背景，也没有完整人工背景标注。
 
-默认重要性文本 cosine 阈值 0.24，top-k 为 0，含义是保留全部达标区域，
-不强制选择低分区域。这是初始设置，不是已证明最优的阈值；用户应先检查词汇
-和区域预览。分档定义需要在实验前固定，不能看测试 IoU 后重新分档包装结果。
+v5 使用 `competitive_v1`：要求目标 CLIP cosine 至少 0.25、相对通用负词的
+相关度至少 0.60、相对于其他档位候选的优势至少 0.04；重要区域面积比例须
+小于 0.80，防止一张覆盖整个餐桌的 mask 被标为重要物品。不确定区域保留普通
+档且 `importance_known=False`，不强制为每个提示词分配区域。旧模式的 0.24
+阈值不是当前 v5 决策规则。这些是固定初值，不是已证明最优的超参数；应先检查
+词汇和区域预览，不能看测试 IoU 后重新分档包装结果。SAM 置信度只是 mask
+质量，不是语义分类的可信概率。
+
+高斯的重要性采用升降对称的 EMA（动量 0.9）；未知像素不更新既有分数。
+与旧版“只要有一次高重要性观察立即上调”不同，不因单视角误匹配永久升档。
+这仍不包含遮挡感知的显式跨视角对应，不能视作已解决所有投影冲突。
 教师实现见 [preprocess_semantics.py](../preprocess_semantics.py)。
 
 ## 4. 15k 配置：预热、损失和高斯预算
@@ -127,9 +136,10 @@ RGB 保留原始 L1/DSSIM 混合，DSSIM 默认 0.2；三级权重直接作用�
 ## 5. 边界和细长物体保护的实际含义
 
 默认边界带宽 3 个语义图像素、边界增强 2.25、细长区域增强 1.50；细长度
-结合紧致度阈值 0.40 和包围盒长宽比阈值 2.5。普通物体边界与细长区域至少
-升级到普通档；重要物体附近边界保留重要档。细节权重直接参与语义损失，
-并通过提升重要性档位影响 RGB 和致密化。
+结合紧致度阈值 0.40 和包围盒长宽比阈值 2.5。v5 的 `competitive_v1` 将边界
+和物品语义分档解耦：边界与细长区域只提高 `detail_weight`，不再自动提升
+`importance` 档位。细节权重直接参与语义损失；不能声称每条边界都获得了
+更高 RGB/致密化档位。重要性容量仍由有足够文本证据的分档控制。
 
 此外对预测和教师特征的局部梯度作边界对齐。它匹配的是 SAM 教师边界，
 不是凭空创造真值边界；如果 SAM 漏掉筷子，单纯增加边界权重或高斯数量仍
@@ -217,3 +227,67 @@ SSIM、mIoU、Boundary-IoU、逐类别和三级统计、高斯数量、GT/渲染
 3D 渲染是否退化。这样才能区分候选漏检、语言不匹配和跨视角蒸馏错误。多随机
 种子和单项消融仍是后续工作；新模型、稀疏视角、单图补全和 UI 端到端表现
 都不能由这份实现说明代替实测。
+
+## 8. 可选：训练后多视角、多粒度区域描述符对齐库
+
+新入口为 [build_semantic_descriptor_bank.py](../scripts/build_semantic_descriptor_bank.py)，
+共享纯数值评分在 [descriptor_bank.py](../semantic/descriptor_bank.py)。这是借鉴
+LaGa 的工程小版本：保留多个原始区域 CLIP 描述子，不将所有视角平均成单个
+语言向量；通过已经训练的独立亲和字段对齐区域与高斯。它不是 LaGa 官方的
+对象级自适应 K-means 聚类，没有生成经过验证的永久对象身份。
+
+构库严格使用训练名单与 PCA `fit_image_names` 一致的相机，只打开选定训练
+图片和缓存，不读取验证/测试 RGB 或人工 mask。默认均匀选择 24 个训练视角，
+每图按层级和 SAM 置信度轮转保留至多 96 个区域、每区域采样至多 512 个有效
+像素；总记录硬上限 8192。每个区域可保存多个层级记录，因此实际默认上限为
+24×96×3=6912 条。采样参数、视角名、缓存 SHA、模型与亲和 SHA 均写入库。
+
+每张图以不截断正负值的方式渲染 16 维亲和特征并除以 alpha，按缓存中的
+原始重叠 SAM mask 池化，不使用会吞掉小物体的独占 region map。区域必须在
+相应粗/中/细层出现，才建立该层记录。每条记录保留原始完整 CLIP 描述子、
+独立亲和向量、视角、区域 ID、层级、SAM 置信度、有效覆盖率和亲和一致度。
+默认过滤 alpha<0.05 的像素、覆盖率<0.35 或池化一致度<0.10 的区域。
+构库校验当前 v5 的 `competitive_v1 / containment / prototype_mode=off`
+教师，并核对工件中的 PCA/编码参数；重要性策略指纹被记录，但重要/普通
+标签不参与候选排名，避免人为提示词权重直接抬高检索分数。
+
+检索分为两步：先以固定正负词相关度（默认≥0.5）筛选语言候选，再仅用同层
+亲和 cosine（默认≥0.8）确认至少两个不同训练视角支持；CLIP 相似度不能充当
+几何对应。每次保留至多 64 条候选，按视角轮转，防止同图大量重叠 mask 占满。
+高斯与候选匹配阈值为亲和 cosine≥0.7；至少两个不同视角匹配后才输出非零分。
+最终分数为 `max(文本相关度×SAM置信度×覆盖率×亲和一致度)`，默认选择阈值
+0.25。不同视角/层级的原始描述子仍在库中，没有被全局平均。这些值是事先固定
+的工程初值，不是通过测试 GT 挑选的最佳参数。
+
+```bash
+# 要先有真正包含独立亲和字段的 v5 导出；已有输出文件不会被覆盖。
+python -m scripts.build_semantic_descriptor_bank \
+  --model /content/ramen_v5_15k/outputs_full/joint --iteration 15000 \
+  --output /content/ramen_v5_region_bank.npz
+
+python semantic_query.py --model /content/ramen_v5_15k/outputs_full/joint \
+  --iteration 15000 --text "chopsticks" --granularity 1 \
+  --descriptor_bank /content/ramen_v5_region_bank.npz --threshold 0.25 \
+  --output /content/chopsticks_bank_selection.npz
+
+# 独立输出目录；只在建库完成后评测，不能与旧评分自动相减。
+python -m scripts.evaluate_lerf_mask \
+  --model /content/ramen_v5_15k/outputs_full/joint --iteration 15000 \
+  --test_mask /content/ramen_v5_scene/test_mask \
+  --descriptor_bank /content/ramen_v5_region_bank.npz \
+  --mask_protocol gg_native --threshold 0.25 --granularity 1 \
+  --boundary_ratio 0.02 --output /content/ramen_v5_eval_region_bank
+```
+
+该分支记录为独立的 `descriptor_bank` 评分，不能把其阈值 0.25 等同于旧 PCA
+cosine 0.25。评测器可调用同一个 `score_descriptor_bank`，对高斯或渲染后的
+alpha 归一亲和像素评分；调用者先核验模型签名，并保持其他 mask 协议一致。
+缺少亲和字段、模型顺序/几何不匹配、训练名单混入 held-out、库不存在有效区域
+时明确报错；无多视角支持的查询返回空，不强制 top-k。
+
+本地 11 项测试覆盖重叠区域保留、跨视角而非同图重复计数、同层支持、文本相同
+但亲和不同的拒绝、分块一致性、模型签名和采样限制；其中带正负值的渲染调用
+测试使用轻量数值替身，不是 CUDA 性能或质量测试。短至 300 步的 smoke 导出
+即使能够构库，也只能验证流程，不能证明亲和已学好或分割有所提升。真实质量
+还须新 v5 完整训练后在固定 annotated 测试集按独立协议测量，并额外报告构库
+时间、库大小和检索时间；不能隐去这一后处理成本。

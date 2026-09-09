@@ -12,6 +12,7 @@ from pathlib import Path
 
 IMPORTANT = "egg,pork belly,wavy noodles in bowl"
 NORMAL = "yellow bowl,chopsticks,glass of water"
+BACKGROUND = "table,wall"
 
 
 def run(command, cwd):
@@ -183,6 +184,7 @@ def detail_preprocessing_complete(scene, heldout_names=None, teacher_version=Non
                 or int(meta["teacher_preprocessing_version"]) != teacher_version
                 or str(meta.get("hierarchy_method", "")) != "containment"
                 or str(meta.get("prototype_mode", "")) != "off"
+                or str(meta.get("importance_policy", "")) != "competitive_v1"
             ):
                 return False
             if feature_dim is not None and (
@@ -207,8 +209,17 @@ def detail_preprocessing_complete(scene, heldout_names=None, teacher_version=Non
                     "detail_weight", "boundary", "thinness", "prototype_ids",
                     "hierarchy_prototype_ids", "region_ids", "hierarchy_region_ids",
                 }
+                if teacher_version is not None:
+                    required |= {"importance", "importance_known"}
                 if not required.issubset(semantic_map.files):
                     return False
+                if teacher_version is not None:
+                    tiers, known = semantic_map["importance"], semantic_map["importance_known"]
+                    if (tiers.ndim != 2 or known.shape != tiers.shape
+                        or tiers.shape != semantic_map["region_ids"].shape
+                        or not np.isin(tiers, [0, 1, 2]).all()
+                        or not np.isin(known, [0, 1]).all()):
+                        return False
                 if feature_dim is not None or feature_width is not None:
                     if "features" not in semantic_map.files:
                         return False
@@ -330,7 +341,9 @@ def main():
     }
     if args.semantic_protocol == "v5":
         requested_protocol.update(teacher_preprocessing_version=2, hierarchy_method="containment",
-                                  prototype_mode="off", sam_crop_n_layers=args.sam_crop_n_layers)
+                                  prototype_mode="off", sam_crop_n_layers=args.sam_crop_n_layers,
+                                  importance_policy="competitive_v1", important_prompts=IMPORTANT,
+                                  normal_prompts=NORMAL, background_prompts=BACKGROUND)
         existing_weights = list(output_root.glob("*/chkpnt*.pth")) + list(output_root.glob("*/point_cloud/iteration_*/*.ply"))
         if existing_weights and recorded_protocol != requested_protocol:
             parser.error("V5 cannot reuse unrecorded or different-protocol weights; choose a new output_root")
@@ -399,7 +412,8 @@ def main():
             "--thin_boost", 1.50, "--thin_compactness", 0.40,
             "--thin_aspect_ratio", 2.5,
             *(["--hierarchy_method", "containment", "--mask_selection", "balanced",
-               "--sam_crop_n_layers", args.sam_crop_n_layers, "--prototype_mode", "off"]
+               "--sam_crop_n_layers", args.sam_crop_n_layers, "--prototype_mode", "off",
+               "--importance_policy", "competitive_v1", "--background", BACKGROUND]
               if args.semantic_protocol == "v5" else []),
         ], repo)
 
@@ -643,7 +657,8 @@ def main():
         "dataset": "LERF-Mask ramen",
         "important": IMPORTANT.split(","),
         "normal": NORMAL.split(","),
-        "background": "all remaining pixels/regions",
+        "background": BACKGROUND.split(",") if args.semantic_protocol == "v5" else "all remaining pixels/regions",
+        "unconfirmed_importance": "normal_without_observation" if args.semantic_protocol == "v5" else None,
         "iterations": args.iterations,
         "semantic_iterations_baseline": args.semantic_iterations,
         "protocol": {

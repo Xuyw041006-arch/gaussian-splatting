@@ -71,7 +71,7 @@ def aggregate_mask_rows(rows, labels, protocol):
     }
 
 
-def render_semantic_feature_map(camera, gaussians, pipeline, background, encoded, alpha, render_function):
+def render_semantic_feature_map(camera, gaussians, pipeline, background, encoded, alpha, render_function, signed=False):
     """Composite encoded feature channels first, then score pixels in CLIP space."""
     import numpy as np
     import torch
@@ -84,7 +84,8 @@ def render_semantic_feature_map(camera, gaussians, pipeline, background, encoded
             size = min(3, dimensions - start)
             colors = torch.zeros((len(encoded), 3), device=background.device)
             colors[:, :size] = torch.from_numpy(encoded[:, start:start + size]).to(background.device)
-            rendered = render_function(camera, gaussians, pipeline, background, override_color=colors)["render"]
+            options = {"clamp_output": False} if signed else {}
+            rendered = render_function(camera, gaussians, pipeline, background, override_color=colors, **options)["render"]
             normalized = rendered[:size] / alpha.clamp_min(1e-4)
             feature_map[:, :, start:start + size] = normalized.permute(1, 2, 0).cpu().numpy()
     return feature_map
@@ -261,6 +262,7 @@ def main():
     parser.add_argument("--threshold", type=float, default=None,
                         help="Default .25 cosine or .5 clip_relevancy; never select using test masks")
     parser.add_argument("--score_mode", choices=("legacy_pca_cosine", "clip_cosine", "clip_relevancy"), default="legacy_pca_cosine")
+    parser.add_argument("--descriptor_bank", help="Optional train-only multi-view region bank; uses a distinct affinity retrieval protocol")
     parser.add_argument("--mask_protocol", choices=("legacy", "gg_native"), default="legacy")
     parser.add_argument("--negative_prompts", nargs="+", default=["object", "things", "stuff", "texture"])
     parser.add_argument("--relevancy_temperature", type=float, default=10.0)
@@ -277,6 +279,8 @@ def main():
     parser.add_argument("--all_test_rgb", action="store_true",
                         help="Also evaluate all test cameras under separate all_test_rgb fields")
     args = parser.parse_args()
+    if args.descriptor_bank:
+        args.score_mode = "descriptor_bank"
     if args.threshold is None:
         args.threshold = 0.5 if args.score_mode == "clip_relevancy" else 0.25
     if args.boundary_ratio is None:
@@ -343,6 +347,18 @@ def main():
         raise RuntimeError("RGB and semantic Gaussian counts do not match")
     encoded = apply_scale_gate(encoded, artifact, args.granularity)
     decoded = decode_features(encoded, artifact["feature_min"].numpy(), artifact["feature_max"].numpy()) if args.score_mode == "legacy_pca_cosine" else None
+    bank, bank_protocol, affinity = None, None, None
+    if args.descriptor_bank:
+        from semantic.descriptor_bank import load_bank, model_signature, score_descriptor_bank
+        if "affinity_features" not in artifact:
+            raise ValueError("Descriptor-bank retrieval needs a trained independent affinity field")
+        affinity = artifact["affinity_features"].float().numpy()
+        signature = model_signature(
+            affinity, args.iteration, artifact["clip_model"], artifact["clip_pretrained"],
+            artifact["affinity_prefix_dimensions"],
+            file_sha256(model_path / "point_cloud" / f"iteration_{args.iteration}" / "point_cloud.ply"),
+        )
+        bank = load_bank(args.descriptor_bank, signature)
 
     try:
         import open_clip
@@ -357,7 +373,7 @@ def main():
     tokenizer = open_clip.get_tokenizer(artifact["clip_model"])
 
     labels = sorted({path.stem for split in splits for path in split.glob("*.png")})
-    phrases = labels + (args.negative_prompts if args.score_mode == "clip_relevancy" else [])
+    phrases = labels + (args.negative_prompts if args.score_mode in ("clip_relevancy", "descriptor_bank") else [])
     with torch.no_grad():
         text = torch.nn.functional.normalize(
             clip_model.encode_text(tokenizer(phrases).to(device)).float(), dim=-1
@@ -448,7 +464,16 @@ def main():
                 ),
             )["render"][0].clamp(0, 1)
         pixel_scores = None
-        if args.score_mode != "legacy_pca_cosine":
+        if args.score_mode == "descriptor_bank":
+            feature_map = render_semantic_feature_map(camera, gaussians, pipeline, background, affinity, alpha, render, signed=True)
+            bank_result = score_descriptor_bank(
+                bank, feature_map.reshape(-1, affinity.shape[1]), text[:len(labels)], text[len(labels):],
+                level=args.granularity, temperature=args.relevancy_temperature,
+            )
+            pixel_scores = bank_result["scores"].reshape(camera.image_height, camera.image_width, len(labels))
+            bank_protocol = bank_result["protocol"]
+            del feature_map, bank_result
+        elif args.score_mode != "legacy_pca_cosine":
             feature_map = render_semantic_feature_map(camera, gaussians, pipeline, background, encoded, alpha, render)
             pixel_decoded = decode_features(feature_map.reshape(-1, encoded.shape[1]), artifact["feature_min"].numpy(), artifact["feature_max"].numpy())
             pixel_scores = text_retrieval_scores(
@@ -493,8 +518,8 @@ def main():
                                  args.threshold, args.granularity, args.boundary_ratio)
     protocol.update({
         "score_mode": args.score_mode, "mask_metric_protocol": args.mask_protocol,
-        "negative_prompts": args.negative_prompts if args.score_mode == "clip_relevancy" else [],
-        "relevancy_temperature": args.relevancy_temperature if args.score_mode == "clip_relevancy" else None,
+        "negative_prompts": args.negative_prompts if args.score_mode in ("clip_relevancy", "descriptor_bank") else [],
+        "relevancy_temperature": args.relevancy_temperature if args.score_mode in ("clip_relevancy", "descriptor_bank") else None,
         "alpha_min": args.alpha_min,
         "score_compositing": "clipped_per_gaussian_cosine_then_render" if args.score_mode == "legacy_pca_cosine" else "render_encoded_features_then_clip_space_score",
         "score_space": "centered_pca" if args.score_mode == "legacy_pca_cosine" else "pca_reconstructed_clip",
@@ -504,6 +529,15 @@ def main():
         "iou_aggregation": "macro_mean_over_labels" if args.mask_protocol == "gg_native" else "mean_over_view_label_rows",
         "layer_selection": "fixed_explicit_granularity_no_test_selection",
     })
+    if bank is not None:
+        protocol.update({
+            "score_space": "raw_clip_region_descriptors_and_independent_affinity",
+            "score_compositing": "render_signed_affinity_then_descriptor_bank_score",
+            "descriptor_bank": {"path": str(Path(args.descriptor_bank).resolve()),
+                                "sha256": file_sha256(args.descriptor_bank),
+                                "retrieval": bank_protocol,
+                                "construction": bank["metadata"]},
+        })
     result = {
         "model": str(model_path),
         "iteration": args.iteration,
