@@ -18,6 +18,34 @@ _helper_spec.loader.exec_module(test_ramen_resume)
 
 
 class RamenV5BenchmarkTests(unittest.TestCase):
+    def test_optional_checkpoint_cadence_unions_legacy_milestones(self):
+        helper = test_ramen_resume.RamenResumeTests()
+        for interval, expected in ((0, [7000, 10000]), (1000, list(range(1000, 15001, 1000)))):
+            with self.subTest(interval=interval), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                scene = helper._scene(root)
+                commands = []
+                argv = ["benchmark", "--scene", str(scene), "--sam_checkpoint", "unused",
+                        "--output_root", str(root / "out"), "--semantic_protocol", "v5",
+                        "--skip_preprocess", "--checkpoint_interval", str(interval)]
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                    benchmark, "run", helper._fake_run(commands)
+                ), mock.patch.object(benchmark, "detail_preprocessing_complete", return_value=True), mock.patch(
+                    "scripts.run_ramen_recovery.establish_semantic_reference"
+                ), mock.patch.object(benchmark, "establish_v5_teacher_files"), contextlib.redirect_stdout(io.StringIO()):
+                    benchmark.main()
+                for command in commands:
+                    if "--checkpoint_iterations" not in command:
+                        continue
+                    values = []
+                    for value in command[command.index("--checkpoint_iterations") + 1:]:
+                        if value.startswith("--"):
+                            break
+                        values.append(int(value))
+                    self.assertEqual(values, expected)
+                saved = json.loads((root / "out/experiment_protocol.json").read_text())
+                self.assertEqual(saved["checkpoint_interval"], interval)
+
     def test_v5_uses_independent_affinity_uniform_rgb_and_identical_retrieval(self):
         helper = test_ramen_resume.RamenResumeTests()
         with tempfile.TemporaryDirectory() as directory:

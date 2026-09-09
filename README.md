@@ -2,17 +2,20 @@
 
 [![Open L4/T4 high-quality training in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_t4_full_smoke_test.ipynb)
 [![Open Ramen joint benchmark in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_ramen_joint_benchmark.ipynb)
+[![Open isolated semantic v5 experiment in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Xuyw041006-arch/gaussian-splatting/blob/main/colab_ramen_semantic_v5.ipynb)
 
 这是基于 Graphdeco 官方 `gaussian-splatting` 主分支的可运行扩展。RGB 训练、CUDA 光栅化、COLMAP 数据读取、深度正则化和 SIBR Viewer 都来自原始 3DGS；本仓库新增训练时联合语义优化、三级重要性资源分配、开放词汇搜索、非破坏性删除和点击检查。跨视图原型与多粒度门控分别受 LaGa、SAGA 启发，但不是两篇论文代码的逐行复现。
 
 > 使用范围继承上游 [LICENSE.md](LICENSE.md)：仅限非商业研究与评估。
 
-2026-09-09 状态：已修正重要性投影、验证集预处理隔离、最佳权重选择和 SH
-支持范围。新训练使用最高三阶 SH、三级容量 `1/2/3`；修正后的 v4 尚无完整 GPU
-训练与评估结果，不能据此宣称语义或重建已提升。问题、证据与待测项见
-[Ramen 代码与证据审计](reports/ramen_audit_2026-09-09.md)。
+2026-09-09 状态：新增独立的 **v5 实验入口**：RGB 预热、语言/多粒度亲和分离、
+训练视角多描述符库、证据驱动的三级重要性。旧权重修正检索后的 Ramen mIoU 为
+42.62%，不是新训练的提升。提交 `3d7faad` 已在 Colab 通过 173 项测试；完整
+15K v5 质量实验尚未完成，不能宣称达到论文水平。见
+[方案与局限](docs/SEMANTIC_V5.md)、[实测诊断](reports/semantic_v5_diagnostic_2026-09-09.md)。
+产品 UI/旧默认流水线不会因新增此实验入口自动切换到 v5。
 
-## 已实现的闭环
+## 已实现的接口（不代表全部完成质量验证）
 
 1. **自建数据**：普通照片复制到标准目录，COLMAP 自动计算相机与稀疏点云。
 2. **先重建、再渐进语义**：前段为真正的纯 RGB warm-up；随后按余弦曲线逐步开启语义、三级重要性、分档 SH 和差异化分裂，避免早期噪声掩码破坏几何。

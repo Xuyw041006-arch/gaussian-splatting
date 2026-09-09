@@ -271,6 +271,8 @@ def main():
     parser.add_argument("--output_root", required=True)
     parser.add_argument("--iterations", type=int, default=15000)
     parser.add_argument("--semantic_iterations", type=int, default=5000)
+    parser.add_argument("--checkpoint_interval", type=int, default=0,
+                        help="Additional RGB/joint checkpoint cadence; 0 preserves the legacy schedule")
     parser.add_argument("--semantic_start", type=int, default=None)
     parser.add_argument("--semantic_ramp_iterations", type=int, default=None)
     parser.add_argument("--feature_dim", type=int, default=32)
@@ -322,6 +324,8 @@ def main():
         parser.error("iteration and feature values must be positive")
     if args.early_stop_patience < 0:
         parser.error("early-stop patience must be non-negative")
+    if args.checkpoint_interval < 0:
+        parser.error("checkpoint interval must be non-negative")
     if not 0 <= args.semantic_start < args.iterations or args.semantic_ramp_iterations < 0:
         parser.error("semantic start/ramp must fit a non-negative curriculum")
     repo = Path(__file__).resolve().parents[1]
@@ -338,8 +342,11 @@ def main():
         "semantic_ramp_iterations": args.semantic_ramp_iterations,
         "feature_dim": args.feature_dim, "feature_width": args.feature_width,
         "validation_views": args.validation_views,
+        "checkpoint_interval": args.checkpoint_interval,
     }
     if args.semantic_protocol == "v5":
+        if recorded_protocol:
+            recorded_protocol.setdefault("checkpoint_interval", 0)
         requested_protocol.update(teacher_preprocessing_version=2, hierarchy_method="containment",
                                   prototype_mode="off", sam_crop_n_layers=args.sam_crop_n_layers,
                                   importance_policy="competitive_v1", important_prompts=IMPORTANT,
@@ -442,6 +449,10 @@ def main():
     checkpoint_iterations = [
         step for step in save_iterations if step < args.iterations
     ]
+    if args.checkpoint_interval:
+        checkpoint_iterations = sorted(set(checkpoint_iterations) | set(
+            range(args.checkpoint_interval, args.iterations + 1, args.checkpoint_interval)
+        ))
     validation_start = min(
         max(args.validation_interval, densify_until // 2),
         max(0, args.iterations - args.validation_interval),
