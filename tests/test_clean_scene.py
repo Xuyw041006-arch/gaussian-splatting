@@ -72,6 +72,31 @@ class CleanSceneTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_plan(data, max_remove_fraction=0.11)
 
+    def test_shape_diagnostics_distinguish_sheets_rods_and_ribbons_without_changing_protection(self):
+        data = vertices()
+        # A flat sheet, ribbon, and moderately anisotropic shape all retain the
+        # original max/min protection, while the diagnostic labels distinguish them.
+        for index, axes in ((4, (0.002, 0.2, 0.2)),
+                            (5, (0.0001, 0.02, 0.3)),
+                            (6, (0.01, 0.03, 0.1))):
+            for axis, scale in enumerate(axes):
+                data[f"scale_{axis}"][index] = np.log(scale)
+            data["opacity"][index] = -5
+        importance = semantic_artifact(len(data))["importance_score"]
+        keep, _, plan = make_plan(data, importance)
+        self.assertTrue(keep[1] and keep[4] and keep[5] and keep[6])
+        self.assertEqual(np.flatnonzero(~keep).tolist(), [0, 3])
+        diagnostics = plan["diagnostics"]
+        self.assertEqual(diagnostics["shape_counts_disjoint"]["elongated_only"], 1)
+        self.assertEqual(diagnostics["shape_counts_disjoint"]["planar_only"], 1)
+        self.assertEqual(diagnostics["shape_counts_disjoint"]["ribbon_elongated_and_planar"], 1)
+        self.assertEqual(diagnostics["shape_counts_disjoint"]["distributed_anisotropy"], 1)
+        self.assertEqual(sum(diagnostics["shape_counts_disjoint"].values()), len(data))
+        self.assertEqual(diagnostics["large_low_opacity_by_shape_disjoint"]["planar_only"], 1)
+        probes = diagnostics["scale_sensitivity_diagnostic_only"]
+        self.assertEqual(probes[0]["middle_axis_radius_fraction"], 0.03)
+        self.assertEqual(probes[0]["planar_nonimportant_protected"], 1)
+
     def test_semantic_arrays_share_identical_order_without_slicing_global_state(self):
         artifact = semantic_artifact(20)
         keep = np.ones(20, dtype=bool)

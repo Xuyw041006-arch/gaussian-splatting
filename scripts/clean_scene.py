@@ -96,7 +96,8 @@ def make_plan(vertices, importance=None, max_remove_fraction=0.10,
     scales = np.exp(np.clip(logs, -60, 60))
     axes = np.sort(scales, axis=1)
     center = np.median(xyz, axis=0)
-    radius = max(float(np.quantile(np.linalg.norm(xyz - center, axis=1), 0.90)),
+    distance = np.linalg.norm(xyz - center, axis=1)
+    radius = max(float(np.quantile(distance, 0.90)),
                  float(np.median(axes[:, 1])) * 10, 1e-12)
     alpha = 1 / (1 + np.exp(-np.clip(vertices["opacity"].astype(float), -60, 60)))
     translucent = ~select_vertices(vertices, min_opacity=low_opacity)
@@ -104,13 +105,19 @@ def make_plan(vertices, importance=None, max_remove_fraction=0.10,
     # The middle axis rejects blobs without classifying every long thin splat
     # (e.g. chopsticks) as too large just because its longest axis is large.
     large = axes[:, 1] > radius * large_radius_fraction
-    thin = axes[:, 2] / np.maximum(axes[:, 0], 1e-30) >= thin_axis_ratio
-    protected = thin.copy()
+    # This conservative legacy policy protects ALL strong anisotropy, including
+    # valid planar surface splats. max/min is not a test for a thin rod alone.
+    anisotropic = axes[:, 2] / np.maximum(axes[:, 0], 1e-30) >= thin_axis_ratio
+    elongated = axes[:, 2] / np.maximum(axes[:, 1], 1e-30) >= thin_axis_ratio
+    planar = axes[:, 1] / np.maximum(axes[:, 0], 1e-30) >= thin_axis_ratio
+    protected = anisotropic.copy()
+    important = np.zeros(len(vertices), dtype=bool)
     if importance is not None:
         importance = np.asarray(importance).reshape(-1)
         if len(importance) != len(vertices) or not np.isfinite(importance).all():
             raise ValueError("Importance array must match the PLY vertex count and be finite")
-        protected |= importance >= 0.75
+        important = importance >= 0.75
+        protected |= important
     reasons = {
         "large_translucent_blob": large & translucent & ~protected,
         "extreme_translucent_floater": distant & translucent & ~protected,
@@ -121,12 +128,55 @@ def make_plan(vertices, importance=None, max_remove_fraction=0.10,
         support = camera_support(xyz, cameras)
         candidate &= support < min_camera_support
     severity = (1 - alpha) * (axes[:, 1] / (radius * large_radius_fraction)
-                             + np.linalg.norm(xyz - center, axis=1) / radius)
+                             + distance / radius)
     candidates = np.flatnonzero(candidate)
     limit = int(math.floor(len(vertices) * max_remove_fraction))
     selected = candidates[np.argsort(-severity[candidates], kind="stable")[:limit]]
     keep = np.ones(len(vertices), dtype=bool)
     keep[selected] = False
+    shape_groups = {
+        "elongated_only": elongated & ~planar,
+        "planar_only": planar & ~elongated,
+        "ribbon_elongated_and_planar": elongated & planar,
+        "distributed_anisotropy": anisotropic & ~elongated & ~planar,
+        "not_strongly_anisotropic": ~anisotropic,
+    }
+    large_translucent = large & translucent
+    diagnostics = {
+        "shape_protection_policy": "all_strong_anisotropy_including_surface_splats",
+        "shape_definitions": {
+            "elongated": "max_axis / middle_axis >= thin_axis_ratio",
+            "planar": "middle_axis / min_axis >= thin_axis_ratio",
+            "distributed_anisotropy": "max/min passes threshold but neither adjacent-axis ratio does",
+        },
+        "shape_counts_disjoint": {name: int(mask.sum()) for name, mask in shape_groups.items()},
+        "importance_protected_count": int(important.sum()),
+        "anisotropy_protected_count": int(anisotropic.sum()),
+        "importance_and_anisotropy_overlap": int((important & anisotropic).sum()),
+        "low_opacity_count": int(translucent.sum()),
+        "large_low_opacity_before_protection": int(large_translucent.sum()),
+        "large_low_opacity_by_shape_disjoint": {
+            name: int((mask & large_translucent).sum()) for name, mask in shape_groups.items()
+        },
+        "large_low_opacity_important": int((large_translucent & important).sum()),
+        "distance_quantiles": {f"q{int(q * 100)}": float(np.quantile(distance, q))
+                               for q in (0.5, 0.75, 0.90, 0.95)},
+        "middle_axis_over_scene_radius_quantiles": {
+            f"q{q * 100:g}": float(np.quantile(axes[:, 1] / radius, q))
+            for q in (0.5, 0.9, 0.95, 0.99, 0.999)
+        },
+        "scale_sensitivity_diagnostic_only": [],
+        "note": "These counts do not change the keep mask. Large planar splats can be valid surfaces; shape alone cannot prove blur.",
+    }
+    for fraction in sorted({large_radius_fraction, 0.01, 0.005}, reverse=True):
+        probe = (axes[:, 1] > radius * fraction) & translucent
+        diagnostics["scale_sensitivity_diagnostic_only"].append({
+            "middle_axis_radius_fraction": fraction,
+            "middle_axis_threshold": radius * fraction,
+            "large_low_opacity_count": int(probe.sum()),
+            "unprotected_before_camera_filter": int((probe & ~protected).sum()),
+            "planar_nonimportant_protected": int((probe & planar & ~elongated & ~important).sum()),
+        })
     plan = {
         "input_gaussians": len(vertices), "output_gaussians": int(keep.sum()),
         "removed_gaussians": len(selected), "candidate_gaussians": len(candidates),
@@ -138,6 +188,7 @@ def make_plan(vertices, importance=None, max_remove_fraction=0.10,
                        "low_opacity": low_opacity, "extreme_radius": radius * extreme_radius_multiplier,
                        "thin_axis_ratio_protection": thin_axis_ratio, "important_score_protection": 0.75},
         "protected_gaussians": int(protected.sum()),
+        "diagnostics": diagnostics,
         "removed_by_reason": {name: int((mask & ~keep).sum()) for name, mask in reasons.items()},
         "camera_support": {"enabled": cameras is not None, "minimum": min_camera_support,
                            "definition": "center inside image frustum; not occlusion-aware visibility"},
@@ -319,7 +370,8 @@ def main():
     parser.add_argument("--large_radius_fraction", type=float, default=0.03)
     parser.add_argument("--low_opacity", type=float, default=0.10)
     parser.add_argument("--extreme_radius_multiplier", type=float, default=4.0)
-    parser.add_argument("--thin_axis_ratio", type=float, default=8.0)
+    parser.add_argument("--thin_axis_ratio", type=float, default=8.0,
+                        help="Conservative max/min anisotropy protection, including planar surfaces; diagnostics separate rods and sheets")
     parser.add_argument("--camera_support_filter", action="store_true")
     parser.add_argument("--min_camera_support", type=int, default=2)
     parser.add_argument("--render_compare", action="store_true")
