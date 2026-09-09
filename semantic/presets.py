@@ -33,8 +33,8 @@ PRESETS = {
         "feature_width": 512,
         "max_masks": 192,
         "points_per_side": 32,
-        "joint_sh_degree": 5,
-        "tier_sh_degrees": (1, 3, 5),
+        "joint_sh_degree": 3,
+        "tier_sh_degrees": (1, 2, 3),
         "semantic_start": 1500,
         "semantic_ramp_iterations": 2500,
         "joint_semantic_weight": 0.22,
@@ -55,8 +55,8 @@ PRESETS = {
         "feature_width": 640,
         "max_masks": 256,
         "points_per_side": 40,
-        "joint_sh_degree": 5,
-        "tier_sh_degrees": (2, 4, 5),
+        "joint_sh_degree": 3,
+        "tier_sh_degrees": (1, 2, 3),
         "semantic_start": 2500,
         "semantic_ramp_iterations": 4000,
         "joint_semantic_weight": 0.26,
@@ -117,4 +117,3 @@ def estimate_minutes(name, views, semantics=True, gpu="l4", capture_mode="dense"
         minutes = 45.0 + minutes * 0.45
     minutes *= speed
     return round(minutes * 0.82), round(minutes * 1.28)
-

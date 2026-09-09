@@ -16,7 +16,9 @@ from semantic.joint import (
     load_joint_map,
     local_semantic_consistency,
     project_tiers_to_gaussians,
+    region_boundaries,
     region_contrastive_loss,
+    semantic_chunk_indices,
     select_granularity,
     select_region_ids,
     tier_weights,
@@ -50,6 +52,12 @@ class JointSemanticSupervisor:
             self.scale_gate.parameters(), lr=args.scale_gate_lr
         )
         self.background = torch.zeros(3, dtype=torch.float32, device="cuda")
+        self.feature_min = torch.from_numpy(
+            self.meta["feature_min"].astype(np.float32)
+        ).cuda()
+        self.feature_range = torch.from_numpy(
+            (self.meta["feature_max"] - self.meta["feature_min"]).astype(np.float32)
+        ).cuda()
         self.prototype_features = None
         if "prototype_features" in self.meta:
             self.prototype_features = torch.from_numpy(
@@ -76,12 +84,18 @@ class JointSemanticSupervisor:
             indices, observations, self.args.importance_ema
         )
 
-    def compute(self, camera, iteration):
+    def compute(self, camera, iteration, validation=False):
+        """Distill sampled training channels or evaluate all channels at middle scale.
+
+        Validation uses no stochastic contrastive/spatial sampling, so the same
+        model and camera have the same data/cross-view/boundary metrics at any step.
+        The caller should run validation under torch.no_grad().
+        """
         path = self.map_path(camera)
         if iteration < self.args.semantic_start or not path.is_file():
             return None
         supervision = load_joint_map(str(path))
-        level = granularity_for_step(iteration)
+        level = 1 if validation else granularity_for_step(iteration)
         target, valid, confidence, prototype_ids = select_granularity(
             supervision, level
         )
@@ -92,7 +106,7 @@ class JointSemanticSupervisor:
         detail_weight = supervision["detail_weight"].cuda(non_blocking=True)
         prototype_ids = prototype_ids.cuda(non_blocking=True)
         region_ids = select_region_ids(supervision, level).cuda(non_blocking=True)
-        boundary = supervision["boundary"].cuda(non_blocking=True)
+        boundary = region_boundaries(region_ids, valid)
         curriculum_weight = cosine_ramp(
             iteration, self.args.semantic_start,
             self.args.semantic_ramp_iterations,
@@ -103,7 +117,10 @@ class JointSemanticSupervisor:
         camera.image_height, camera.image_width = height, width
         try:
             features = self.gaussians.get_semantic_features * self.scale_gate(level)
-            chunks = (self.dimensions + 2) // 3
+            selected_chunks = semantic_chunk_indices(
+                self.dimensions, self.args.semantic_chunks_per_step,
+                iteration, validation=validation,
+            )
 
             with torch.no_grad():
                 alpha = render(
@@ -123,13 +140,18 @@ class JointSemanticSupervisor:
             chunk_losses = []
             cross_view_losses = []
             boundary_losses = []
-            contrastive_losses = []
+            contrastive_features = []
+            chunk_widths = []
+            cross_view_widths = []
             packages = []
-            first_chunk = (iteration * self.args.semantic_chunks_per_step) % chunks
-            for offset in range(min(self.args.semantic_chunks_per_step, chunks)):
-                chunk = (first_chunk + offset) % chunks
+            use_contrastive = (
+                not validation and self.args.semantic_contrastive_weight > 0
+                and iteration % self.args.semantic_contrastive_every == 0
+            )
+            for chunk in selected_chunks:
                 start = 3 * chunk
                 stop = min(start + 3, self.dimensions)
+                chunk_widths.append(stop - start)
                 colors = torch.zeros((features.shape[0], 3), device="cuda")
                 colors[:, :stop - start] = features[:, start:stop]
                 semantic_package = render(
@@ -146,11 +168,15 @@ class JointSemanticSupervisor:
                 boundary_losses.append(boundary_alignment_loss(
                     prediction, target[start:stop], boundary, active, weights
                 ))
-                if iteration % self.args.semantic_contrastive_every == 0:
-                    contrastive_losses.append(region_contrastive_loss(
-                        prediction, region_ids, active,
-                        self.args.semantic_contrastive_samples, weights,
-                    ))
+                if use_contrastive:
+                    # Decode min/max storage before cosine similarity: its
+                    # positive offset otherwise makes unrelated regions similar.
+                    # Use all channels already rendered in this step jointly;
+                    # do not force every three-channel slice to separate regions.
+                    contrastive_features.append(
+                        prediction * self.feature_range[start:stop, None, None]
+                        + self.feature_min[start:stop, None, None]
+                    )
                 if self.prototype_features is not None:
                     prototype_valid = active & (prototype_ids >= 0)
                     if prototype_valid.any():
@@ -165,20 +191,30 @@ class JointSemanticSupervisor:
                             (prototype_error * prototype_weights).sum()
                             / prototype_weights.sum().clamp_min(1e-8)
                         )
+                        cross_view_widths.append(stop - start)
                 packages.append(semantic_package)
-            data_loss = torch.stack(chunk_losses).mean()
+
+            def channel_mean(values, widths):
+                widths = prediction.new_tensor(widths)
+                return (torch.stack(values) * widths).sum() / widths.sum()
+
+            # The last chunk has two channels for a 32-D field. Weight by width
+            # so validation is a true mean over all 32 dimensions, not 11 groups.
+            data_loss = channel_mean(chunk_losses, chunk_widths)
             cross_view_loss = (
-                torch.stack(cross_view_losses).mean()
+                channel_mean(cross_view_losses, cross_view_widths)
                 if cross_view_losses else prediction.new_zeros(())
             )
-            boundary_loss = torch.stack(boundary_losses).mean()
+            boundary_loss = channel_mean(boundary_losses, chunk_widths)
             contrastive_loss = (
-                torch.stack(contrastive_losses).mean()
-                if contrastive_losses else prediction.new_zeros(())
+                region_contrastive_loss(
+                    torch.cat(contrastive_features, dim=0), region_ids, active,
+                    self.args.semantic_contrastive_samples, weights,
+                ) if contrastive_features else prediction.new_zeros(())
             )
 
             spatial_loss = prediction.new_zeros(())
-            if iteration % self.args.semantic_spatial_every == 0:
+            if not validation and iteration % self.args.semantic_spatial_every == 0:
                 spatial_loss = local_semantic_consistency(
                     self.gaussians, self.args.semantic_spatial_samples,
                     self.args.semantic_edge_sigma,
@@ -206,10 +242,9 @@ class JointSemanticSupervisor:
                 ),
                 "packages": packages,
                 "level": level,
-                "chunks": [
-                    (first_chunk + offset) % chunks
-                    for offset in range(min(self.args.semantic_chunks_per_step, chunks))
-                ],
+                "chunks": selected_chunks,
+                "evaluated_dimensions": sum(chunk_widths),
+                "validation": bool(validation),
             }
         finally:
             camera.image_height, camera.image_width = original_size

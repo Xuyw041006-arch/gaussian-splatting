@@ -34,6 +34,17 @@ def granularity_for_step(step):
     return int(step) % len(GRANULARITIES)
 
 
+def semantic_chunk_indices(dimensions, chunks_per_step, iteration, validation=False):
+    """Keep validation coverage fixed while sampling channels during training."""
+    chunks = (int(dimensions) + 2) // 3
+    if chunks < 1 or int(chunks_per_step) < 1:
+        raise ValueError("semantic dimensions and chunks_per_step must be positive")
+    if validation:
+        return list(range(chunks))
+    first = (int(iteration) * int(chunks_per_step)) % chunks
+    return [(first + offset) % chunks for offset in range(min(int(chunks_per_step), chunks))]
+
+
 @lru_cache(maxsize=8)
 def load_joint_map(path):
     """Load a semantic map while remaining compatible with pre-hierarchy artifacts."""
@@ -158,6 +169,18 @@ def select_region_ids(supervision, level):
     return supervision["region_ids"]
 
 
+def region_boundaries(region_ids, valid):
+    """Boundaries for the selected granularity, including its valid-side rim."""
+    boundary = torch.zeros_like(valid, dtype=torch.bool)
+    horizontal = region_ids[:, 1:] != region_ids[:, :-1]
+    vertical = region_ids[1:, :] != region_ids[:-1, :]
+    boundary[:, 1:] |= horizontal
+    boundary[:, :-1] |= horizontal
+    boundary[1:, :] |= vertical
+    boundary[:-1, :] |= vertical
+    return boundary & valid
+
+
 def tier_weights(tiers, weights):
     """Map integer tiers 0/1/2 to background/normal/important weights."""
     values = torch.as_tensor(weights, dtype=torch.float32, device=tiers.device)
@@ -179,10 +202,15 @@ def project_tiers_to_gaussians(xyz, camera, tiers, visible_indices):
     clip = homogeneous @ camera.full_proj_transform
     ndc = clip[:, :3] / clip[:, 3:].clamp_min(1e-7)
     height, width = tiers.shape[-2:]
-    x = ((ndc[:, 0] + 1.0) * 0.5 * width).long()
-    y = ((1.0 - ndc[:, 1]) * 0.5 * height).long()
+    # Match cuda_rasterizer/auxiliary.h::ndc2Pix, including pixel centers.
+    # COLMAP/rasterizer image Y already points down; flipping it swaps object tiers.
+    pixel_x = ((ndc[:, 0] + 1.0) * width - 1.0) * 0.5
+    pixel_y = ((ndc[:, 1] + 1.0) * height - 1.0) * 0.5
+    x = torch.floor(pixel_x + 0.5).long()
+    y = torch.floor(pixel_y + 0.5).long()
     inside = (
-        (clip[:, 3] > 0) & (x >= 0) & (x < width) & (y >= 0) & (y < height)
+        (clip[:, 3] > 0) & torch.isfinite(ndc).all(dim=1)
+        & (x >= 0) & (x < width) & (y >= 0) & (y < height)
     )
     selected = visible_indices[inside]
     observations = tiers[y[inside], x[inside]].to(
@@ -229,7 +257,9 @@ def local_semantic_consistency(gaussians, samples=512, edge_sigma=0.20):
     return (error * edge_weight).sum() / edge_weight.sum().clamp_min(1e-7)
 
 
-def boundary_alignment_loss(prediction, target, boundary, valid, pixel_weights=None):
+def boundary_alignment_loss(
+    prediction, target, boundary, valid, pixel_weights=None, trusted_background=None,
+):
     """Match semantic feature discontinuities to SAM object boundaries.
 
     The loss supervises both sides of an edge and also discourages false edges
@@ -244,8 +274,11 @@ def boundary_alignment_loss(prediction, target, boundary, valid, pixel_weights=N
     pred_y = torch.abs(prediction[:, 1:, :] - prediction[:, :-1, :]).mean(dim=0)
     target_x = torch.abs(target[:, :, 1:] - target[:, :, :-1]).mean(dim=0)
     target_y = torch.abs(target[:, 1:, :] - target[:, :-1, :]).mean(dim=0)
-    valid_x = valid[:, 1:] & valid[:, :-1]
-    valid_y = valid[1:, :] & valid[:-1, :]
+    # Unannotated pixels are not automatically background. A caller may include
+    # explicitly verified background only when its target features are available.
+    known = valid if trusted_background is None else valid | trusted_background.bool()
+    valid_x = known[:, 1:] & known[:, :-1]
+    valid_y = known[1:, :] & known[:-1, :]
     boundary_x = boundary[:, 1:] | boundary[:, :-1]
     boundary_y = boundary[1:, :] | boundary[:-1, :]
 

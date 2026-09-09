@@ -21,6 +21,7 @@ from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.validation_state import validation_decision
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.importance_utils import (
@@ -109,6 +110,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     importance_cache = {}
     validation_history = []
     best_val_psnr = float("-inf")
+    patience_reference_psnr = float("-inf")
     best_val_iteration = 0
     validation_without_improvement = 0
     early_stopped = False
@@ -133,6 +135,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             best_val_psnr = float(
                 previous_validation.get("best_psnr", float("-inf"))
             )
+            patience_reference_psnr = best_val_psnr
             validation_without_improvement = sum(
                 int(item.get("iteration", 0)) > best_val_iteration
                 for item in validation_history
@@ -276,12 +279,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                if joint_result is not None:
-                    for semantic_package in joint_result["packages"]:
-                        gaussians.add_densification_stats(
-                            semantic_package["viewspace_points"],
-                            semantic_package["visibility_filter"],
-                        )
+                # Count one RGB gradient observation per view. Semantic chunks
+                # must not change this denominator; their importance tiers
+                # still control the splitting thresholds below.
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -331,18 +331,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     semantic_values = []
                     cross_view_values = []
                     boundary_values = []
-                    semantic_eval_iteration = iteration
-                    while semantic_eval_iteration % 3 != 1:
-                        semantic_eval_iteration += 1
-                    if (
-                        joint_args.semantic_spatial_every > 1
-                        and semantic_eval_iteration
-                        % joint_args.semantic_spatial_every == 0
-                    ):
-                        semantic_eval_iteration += 3
                     for validation_camera in scene.getValCameras():
                         semantic_result = joint.compute(
-                            validation_camera, semantic_eval_iteration
+                            validation_camera, iteration, validation=True
                         )
                         if semantic_result is not None:
                             semantic_values.append(
@@ -364,15 +355,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         validation_record["boundary_l1"] = sum(
                             boundary_values
                         ) / len(boundary_values)
+                        validation_record["semantic_validation_scope"] = "all_dimensions_middle_granularity"
                 validation_history.append(validation_record)
                 print(
                     f"\n[ITER {iteration}] Validation PSNR {validation_psnr:.6f} "
                     f"({gaussians.get_xyz.shape[0]} Gaussians)"
                 )
-                if validation_psnr > best_val_psnr + joint_args.early_stop_min_delta:
+                select_best, significant, patience_reference_psnr = validation_decision(
+                    validation_psnr, best_val_psnr, patience_reference_psnr,
+                    joint_args.early_stop_min_delta,
+                )
+                if select_best:
                     best_val_psnr = validation_psnr
                     best_val_iteration = iteration
-                    validation_without_improvement = 0
                     temporary_path = best_validation_checkpoint + ".tmp"
                     torch.save(
                         (
@@ -382,8 +377,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         temporary_path,
                     )
                     os.replace(temporary_path, best_validation_checkpoint)
-                else:
-                    validation_without_improvement += 1
+                validation_without_improvement = (
+                    0 if significant else validation_without_improvement + 1
+                )
                 write_validation_summary(
                     scene.model_path, validation_history, best_val_iteration,
                     best_val_psnr, iteration, False,
@@ -608,10 +604,14 @@ if __name__ == "__main__":
         metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
     )
     parser.add_argument(
-        "--tier_sh_degrees", nargs=3, type=int, default=(1, 3, 5),
+        "--tier_sh_degrees", nargs=3, type=int, default=(1, 2, 3),
         metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
     )
     args = parser.parse_args(sys.argv[1:])
+    if args.sh_degree > 3 and not args.start_checkpoint:
+        parser.error("The bundled CUDA rasterizer supports SH degree 0..3; use --sh_degree 3")
+    if args.sh_degree < 0:
+        parser.error("SH degree must be non-negative")
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)

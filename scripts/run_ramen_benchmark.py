@@ -164,7 +164,7 @@ def semantic_time_budget_complete(model, iteration, target):
     ) >= int(target)
 
 
-def detail_preprocessing_complete(scene):
+def detail_preprocessing_complete(scene, heldout_names=None):
     meta_path = Path(scene) / "semantic_meta.npz"
     maps = sorted((Path(scene) / "semantic_maps").glob("*.npz"))
     if not meta_path.is_file() or not maps:
@@ -174,6 +174,14 @@ def detail_preprocessing_complete(scene):
         with np.load(meta_path) as meta:
             if "prototype_features" not in meta.files:
                 return False
+            if heldout_names is not None:
+                if "heldout_image_names" not in meta.files or "fit_image_names" not in meta.files:
+                    return False
+                expected = set(heldout_names)
+                if set(meta["heldout_image_names"].tolist()) != expected:
+                    return False
+                if expected.intersection(meta["fit_image_names"].tolist()):
+                    return False
         with np.load(maps[0]) as semantic_map:
             required = {
                 "detail_weight", "boundary", "thinness", "prototype_ids",
@@ -272,11 +280,12 @@ def main():
     )
     print("Validation views:", [path.name for path in validation_images])
 
-    preprocessed = detail_preprocessing_complete(scene)
+    preprocessed = detail_preprocessing_complete(scene, [p.name for p in validation_images])
     if not args.skip_preprocess and not (args.resume and preprocessed):
         run([
             sys.executable, repo / "preprocess_semantics.py",
             "--scene", scene, "--images_subdir", "images_train",
+            "--fit_exclude_list", val_file,
             "--sam_checkpoint", Path(args.sam_checkpoint).resolve(), "--sam_model", "vit_h",
             "--clip_model", "ViT-H-14", "--clip_pretrained", "laion2b_s32b_b79k",
             "--feature_dim", args.feature_dim, "--feature_width", args.feature_width,

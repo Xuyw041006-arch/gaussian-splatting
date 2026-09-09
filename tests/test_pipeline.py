@@ -22,7 +22,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("--importance_mask_dir", rgb)
         self.assertIn("--joint_semantics", rgb)
         self.assertIn("--rgb_tier_weights", rgb)
-        self.assertEqual(rgb[rgb.index("--sh_degree") + 1], "5")
+        self.assertEqual(rgb[rgb.index("--sh_degree") + 1], "3")
         self.assertIn("--random_background", rgb)
         self.assertEqual(rgb[rgb.index("--densify_until_iter") + 1], "80")
         self.assertIn("ViT-H-14", steps[1].command)

@@ -365,6 +365,8 @@ def main():
         parser.error("Cross-view weight must be in [0, 1] and importance EMA in [0, 1)")
     if max(args.tier_sh_degrees) > args.joint_sh_degree or min(args.tier_sh_degrees) < 0:
         parser.error("Tier SH degrees must be within [0, --joint_sh_degree]")
+    if not 0 <= args.joint_sh_degree <= 3:
+        parser.error("The bundled CUDA renderer supports joint SH degrees 0..3")
     adaptive_weights = (
         list(args.rgb_tier_weights) + list(args.semantic_tier_weights)
         + list(args.tier_densify_multipliers)

@@ -81,35 +81,38 @@ def build_hierarchy_region_maps(regions, size, image_area, fine_ratio=0.05, coar
 
 def aggregate_cross_view_features(
     features, confidences, max_prototypes=64, weight=0.65,
-    return_centers=False,
+    return_centers=False, fit_mask=None,
 ):
-    """LaGa-inspired scene prototypes suppress view-specific CLIP noise."""
+    """Fit scene prototypes on training regions, then transform every view."""
     features = np.asarray(features, dtype=np.float32)
     confidences = np.asarray(confidences, dtype=np.float32)
-    if len(features) < 2 or max_prototypes < 1 or weight <= 0:
+    fit_mask = np.ones(len(features), dtype=bool) if fit_mask is None else np.asarray(fit_mask, dtype=bool)
+    if fit_mask.shape != (len(features),) or not fit_mask.any():
+        raise ValueError("Prototype fitting needs a nonempty training-region mask")
+    fit_features = features[fit_mask]
+    if len(fit_features) < 2 or max_prototypes < 1 or weight <= 0:
         result = (
             features.copy(), np.zeros(len(features), dtype=np.int32),
             np.zeros(len(features), dtype=np.float32),
         )
         if return_centers:
-            centers = features[:1].copy() if len(features) else np.zeros(
-                (0, features.shape[-1]), dtype=np.float32
-            )
+            centers = fit_features[:1].copy()
             return (*result, centers)
         return result
     from sklearn.cluster import MiniBatchKMeans
-    clusters = min(int(max_prototypes), max(2, int(round(np.sqrt(len(features))))))
+    clusters = min(int(max_prototypes), len(fit_features), max(2, int(round(np.sqrt(len(fit_features))))))
     model = MiniBatchKMeans(
         n_clusters=clusters, random_state=42,
-        batch_size=min(2048, len(features)), n_init=3,
+        batch_size=min(2048, len(fit_features)), n_init=3,
     )
-    labels = model.fit_predict(features)
+    model.fit(fit_features)
+    labels = model.predict(features)
     centers = model.cluster_centers_.astype(np.float32)
     centers /= np.maximum(np.linalg.norm(centers, axis=1, keepdims=True), 1e-8)
     similarity = np.sum(features * centers[labels], axis=1)
     compactness = np.zeros(clusters, dtype=np.float32)
     for cluster in range(clusters):
-        selected = similarity[labels == cluster]
+        selected = similarity[(labels == cluster) & fit_mask]
         compactness[cluster] = max(
             float(selected.mean()) if len(selected) else 0.0, 0.0
         )
@@ -123,6 +126,21 @@ def aggregate_cross_view_features(
         blend.astype(np.float32),
     )
     return (*result, centers) if return_centers else result
+
+
+def fit_training_pca(features, dimensions, fit_mask):
+    """Fit PCA and encoding bounds without incorporating held-out descriptors."""
+    from sklearn.decomposition import PCA
+
+    features = np.asarray(features, dtype=np.float32)
+    fit_mask = np.asarray(fit_mask, dtype=bool)
+    if fit_mask.shape != (len(features),) or not fit_mask.any():
+        raise ValueError("PCA fitting needs a nonempty training-region mask")
+    pca = PCA(n_components=int(dimensions), random_state=42)
+    pca.fit(features[fit_mask])
+    projected = pca.transform(features)
+    fit_projected = projected[fit_mask]
+    return pca, projected, fit_projected.min(axis=0), fit_projected.max(axis=0)
 
 
 def _expand_binary(mask, iterations):
@@ -207,14 +225,17 @@ def build_detail_supervision(
 
 
 def select_prompt_regions(features, text_features, threshold, topk):
-    if text_features is None or len(features) == 0:
+    """Select supported matches; top-k caps matches and never bypasses confidence."""
+    if text_features is None or len(text_features) == 0 or len(features) == 0:
         return set()
     similarities = features @ text_features.T
-    chosen = set(np.flatnonzero(similarities.max(axis=1) >= threshold))
-    if topk > 0:
-        for prompt_index in range(text_features.shape[0]):
-            count = min(int(topk), len(features))
-            chosen.update(np.argsort(similarities[:, prompt_index])[-count:].tolist())
+    chosen = set()
+    for prompt_index in range(text_features.shape[0]):
+        scores = similarities[:, prompt_index]
+        supported = np.flatnonzero(np.isfinite(scores) & (scores >= threshold))
+        if topk > 0 and len(supported) > topk:
+            supported = supported[np.argsort(scores[supported])[-int(topk):]]
+        chosen.update(supported.tolist())
     return chosen
 
 
@@ -247,6 +268,10 @@ def main():
     parser = ArgumentParser(description="Prepare semantic supervision for 3DGS")
     parser.add_argument("--scene", required=True, help="COLMAP scene root containing images/")
     parser.add_argument("--images_subdir", default="images")
+    parser.add_argument(
+        "--fit_exclude_list", default="",
+        help="Newline-delimited held-out image names: transform them but exclude from prototype/PCA fitting",
+    )
     parser.add_argument("--sam_checkpoint", required=True)
     parser.add_argument("--sam_model", choices=["vit_b", "vit_l", "vit_h"], default="vit_h")
     parser.add_argument("--clip_model", default="ViT-H-14")
@@ -280,7 +305,10 @@ def main():
         help="Optional JSON mapping image filename/stem to normal-priority objects",
     )
     parser.add_argument("--importance_threshold", type=float, default=0.24)
-    parser.add_argument("--importance_topk", type=int, default=1)
+    parser.add_argument(
+        "--importance_topk", type=int, default=0,
+        help="Maximum above-threshold regions per prompt; 0 keeps all supported matches",
+    )
     parser.add_argument("--fine_area_ratio", type=float, default=0.05)
     parser.add_argument("--coarse_area_ratio", type=float, default=0.25)
     parser.add_argument("--background_area_ratio", type=float, default=0.80)
@@ -333,6 +361,26 @@ def main():
     paths = image_files(images_dir)
     if not paths:
         parser.error(f"No supported images in {images_dir}")
+    excluded_names = set()
+    if args.fit_exclude_list:
+        exclude_path = Path(args.fit_exclude_list).resolve()
+        if not exclude_path.is_file():
+            parser.error(f"Missing fitting exclusion list: {exclude_path}")
+        excluded_names = {
+            Path(line.strip()).name for line in exclude_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        known_names = {value for path in paths for value in (path.name, path.stem)}
+        if excluded_names - known_names:
+            parser.error("Unknown held-out images in fitting exclusion list: " + ", ".join(sorted(excluded_names - known_names)))
+    fit_image_names = [
+        path.name for path in paths
+        if path.name not in excluded_names and path.stem not in excluded_names
+    ]
+    if not fit_image_names:
+        parser.error("Fitting exclusions leave no training images")
+    fit_image_set = set(fit_image_names)
+    heldout_image_names = [path.name for path in paths if path.name not in fit_image_set]
 
     try:
         import open_clip
@@ -471,6 +519,10 @@ def main():
         })
 
     stacked_raw = np.concatenate(all_features, axis=0)
+    fit_mask = np.concatenate([
+        np.full(len(record["features"]), record["path"].name in fit_image_set, dtype=bool)
+        for record in records
+    ])
     repo = Path(__file__).resolve().parent
     candidate_labels = load_inventory_candidates(
         repo, args.inventory_candidates, args.inventory_candidates_file
@@ -487,8 +539,9 @@ def main():
             view_ids.extend([record["path"].name] * len(record["features"]))
             region_areas.extend(record["area_ratios"].tolist())
         inventory = rank_scene_inventory(
-            stacked_raw, candidate_text, candidate_labels, view_ids,
-            region_areas, args.inventory_threshold, args.inventory_topk_per_region,
+            stacked_raw[fit_mask], candidate_text, candidate_labels,
+            np.asarray(view_ids)[fit_mask].tolist(),
+            np.asarray(region_areas)[fit_mask], args.inventory_threshold, args.inventory_topk_per_region,
         )
         for item in inventory:
             item["selected_tier"] = selected_inventory_tiers.get(item["label"])
@@ -508,14 +561,12 @@ def main():
     stacked, prototype_ids, prototype_weights, prototype_centers = aggregate_cross_view_features(
         stacked_raw, stacked_confidence,
         args.cross_view_prototypes, args.cross_view_weight, return_centers=True,
+        fit_mask=fit_mask,
     )
-    dimensions = min(args.feature_dim, stacked.shape[0], stacked.shape[1])
+    dimensions = min(args.feature_dim, int(fit_mask.sum()), stacked.shape[1])
     if dimensions < 3:
         raise RuntimeError("Too few SAM regions to fit a semantic feature space")
-    pca = PCA(n_components=dimensions, random_state=42)
-    projected = pca.fit_transform(stacked)
-    feature_min = projected.min(axis=0)
-    feature_max = projected.max(axis=0)
+    pca, projected, feature_min, feature_max = fit_training_pca(stacked, dimensions, fit_mask)
     feature_range = np.maximum(feature_max - feature_min, 1e-6)
     encoded_prototypes = (
         pca.transform(prototype_centers) - feature_min
@@ -537,7 +588,9 @@ def main():
             hierarchy_region_maps = raw["hierarchy_region_maps"]
         count = len(record["features"])
         current_prototype_ids = prototype_ids[offset:offset + count]
-        encoded = (projected[offset:offset + count] - feature_min) / feature_range
+        encoded = np.clip(
+            (projected[offset:offset + count] - feature_min) / feature_range, 0.0, 1.0,
+        )
         aggregated_features = stacked[offset:offset + count]
         offset += count
         valid = region_map >= 0
@@ -650,9 +703,20 @@ def main():
         clip_model=np.array(args.clip_model),
         clip_pretrained=np.array(args.clip_pretrained),
         prototype_features=encoded_prototypes.astype(np.float32),
+        fit_image_names=np.asarray(fit_image_names),
+        heldout_image_names=np.asarray(heldout_image_names),
+        fit_region_count=np.asarray(int(fit_mask.sum())),
     )
     summary = {
         "images": len(paths), "regions": int(stacked.shape[0]),
+        "fit_protocol": {
+            "fit_exclude_list": str(Path(args.fit_exclude_list).resolve()) if args.fit_exclude_list else None,
+            "fit_image_names": fit_image_names,
+            "heldout_image_names": heldout_image_names,
+            "fit_regions": int(fit_mask.sum()),
+            "heldout_regions": int((~fit_mask).sum()),
+            "prototype_pca_bounds_training_only": bool(heldout_image_names),
+        },
         "feature_dim": dimensions, "important_prompts": prompts,
         "normal_prompts": normal_prompts,
         "background_prompts": background_prompts,
