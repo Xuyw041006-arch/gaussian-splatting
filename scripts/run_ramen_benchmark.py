@@ -226,8 +226,10 @@ def establish_v5_teacher_files(scene, output_root, image_names, existing_weights
     """Freeze every required teacher map, not only the PCA coordinate system."""
     scene, output_root = Path(scene), Path(output_root)
     entries = {}
-    for name in sorted(image_names):
-        relative = f"semantic_maps/{Path(name).stem}.npz"
+    relatives = [relative for name in sorted(image_names) for relative in (
+        f"semantic_maps/{Path(name).stem}.npz", f"importance_masks/{Path(name).stem}.png",
+    )]
+    for relative in relatives:
         path = scene / relative
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f"Missing or non-regular V5 teacher map: {path}")
@@ -572,6 +574,9 @@ def main():
             equal_time_available = (
                 args.equal_time and valid_seconds(joint_seconds)
                 and valid_seconds(rgb_seconds) and joint_seconds > rgb_seconds
+                and all(timings.get(name + "_timing_complete") is True
+                        and timings.get(name + "_completed") is True
+                        for name in ("joint_train_seconds", "sequential_rgb_seconds"))
             )
             if args.equal_time and not equal_time_available:
                 print(

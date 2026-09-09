@@ -105,15 +105,21 @@ class RamenV5BenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             scene, output = Path(directory) / "scene", Path(directory) / "out"
             (scene / "semantic_maps").mkdir(parents=True)
+            (scene / "importance_masks").mkdir()
             output.mkdir()
             for name in ("a", "val"):
                 (scene / "semantic_maps" / f"{name}.npz").write_bytes(name.encode())
+                (scene / "importance_masks" / f"{name}.png").write_bytes(name.encode())
             names = ["a.jpg", "val.jpg"]
             with self.assertRaises(RuntimeError):
                 benchmark.establish_v5_teacher_files(scene, output, names, existing_weights=True)
             first = benchmark.establish_v5_teacher_files(scene, output, names)
             again = benchmark.establish_v5_teacher_files(scene, output, names, existing_weights=True)
             self.assertEqual(first, again)
+            (scene / "importance_masks/val.png").write_bytes(b"changed weight")
+            with self.assertRaises(RuntimeError):
+                benchmark.establish_v5_teacher_files(scene, output, names, existing_weights=True)
+            (scene / "importance_masks/val.png").write_bytes(b"val")
             (scene / "semantic_maps/val.npz").write_bytes(b"changed")
             with self.assertRaises(RuntimeError):
                 benchmark.establish_v5_teacher_files(scene, output, names, existing_weights=True)
