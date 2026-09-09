@@ -6,9 +6,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 import numpy as np
-import torch
 from PIL import Image
-from tqdm import tqdm
 
 from semantic.inventory import (
     normalize_label,
@@ -27,15 +25,29 @@ def image_files(directory):
     )
 
 
-def masked_crop(rgb, mask, bbox):
-    x, y, width, height = [int(value) for value in bbox]
-    crop = rgb[y:y + height, x:x + width].copy()
-    crop_mask = mask[y:y + height, x:x + width]
+def masked_crop(rgb, mask, bbox=None):
+    """Keep the whole region through CLIP's Resize + CenterCrop transform.
+
+    LangSplat/LaGa pad masked crops before encoding. A raw elongated rectangle
+    would lose its ends in the standard OpenCLIP center crop. Derive inclusive
+    bounds from the mask so a one-pixel-wide region never makes an empty crop.
+    """
+    ys, xs = np.nonzero(mask)
+    if not len(xs):
+        raise ValueError("Cannot encode an empty SAM mask")
+    x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+    crop = rgb[y0:y1, x0:x1].copy()
+    crop_mask = mask[y0:y1, x0:x1]
     crop[~crop_mask] = 255
-    return Image.fromarray(crop)
+    side = max(crop.shape[:2])
+    padded = np.full((side, side, 3), 255, dtype=np.uint8)
+    y, x = (side - crop.shape[0]) // 2, (side - crop.shape[1]) // 2
+    padded[y:y + crop.shape[0], x:x + crop.shape[1]] = crop
+    return Image.fromarray(padded)
 
 
 def encode_regions(model, preprocess, rgb, regions, device, batch_size):
+    import torch
     crops = [masked_crop(rgb, region["segmentation"], region["bbox"]) for region in regions]
     outputs = []
     with torch.no_grad():
@@ -51,9 +63,36 @@ def encode_regions(model, preprocess, rgb, regions, device, batch_size):
 
 
 def resize_mask(mask, size):
-    return np.asarray(
-        Image.fromarray(mask.astype(np.uint8) * 255).resize(size, Image.Resampling.NEAREST)
-    ) > 0
+    """Keep thin-mask pixel coverage when downsampling instead of dropping it."""
+    mask = np.asarray(mask, dtype=bool)
+    if size[0] < mask.shape[1] or size[1] < mask.shape[0]:
+        # Positive box occupancy conserves subpixel structures. The resulting
+        # rasterized boundary can expand by one feature pixel; record this rule.
+        return np.asarray(Image.fromarray(mask.astype(np.float32)).resize(size, Image.Resampling.BOX)) > 0
+    return np.asarray(Image.fromarray(mask.astype(np.uint8)).resize(size, Image.Resampling.NEAREST)) > 0
+
+
+def select_balanced_regions(regions, max_masks, image_area, fine_ratio=0.05, coarse_ratio=0.25):
+    """Reserve mask capacity across scales instead of discarding all small masks."""
+    if max_masks < 1:
+        raise ValueError("max_masks must be positive")
+    ranked = sorted(regions, key=lambda region: (
+        float(region.get("predicted_iou", 1)) * float(region.get("stability_score", 1)),
+        -float(region["area"]),
+    ), reverse=True)
+    groups = [[], [], []]
+    for index, region in enumerate(ranked):
+        ratio = float(region["area"]) / max(image_area, 1)
+        groups[2 if ratio < fine_ratio else 1 if ratio < coarse_ratio else 0].append(index)
+    selected = set()
+    quota = max_masks // 3
+    for group in groups:
+        selected.update(group[:quota])
+    for index in range(len(ranked)):
+        if len(selected) >= max_masks:
+            break
+        selected.add(index)
+    return sorted((ranked[index] for index in selected), key=lambda region: region["area"], reverse=True)
 
 
 def build_region_map(regions, size, indices=None):
@@ -61,27 +100,94 @@ def build_region_map(regions, size, indices=None):
     # Broad regions are assigned first; smaller objects overwrite them.
     if indices is None:
         indices = range(len(regions))
-    for index in indices:
+    for index in sorted(indices, key=lambda value: regions[value]["area"], reverse=True):
         region = regions[index]
         region_map[resize_mask(region["segmentation"], size)] = index
     return region_map
 
 
-def build_hierarchy_region_maps(regions, size, image_area, fine_ratio=0.05, coarse_ratio=0.25):
-    """Group SAM masks into SAGA-style coarse, middle and fine levels."""
+def mask_containment_parents(masks, containment=0.90, minimum_growth=1.15):
+    """Find each region's smallest genuinely containing larger region."""
+    masks = np.asarray(masks, dtype=bool)
+    flat = masks.reshape(len(masks), -1)
+    areas = flat.sum(axis=1)
+    parents = np.full(len(masks), -1, dtype=np.int32)
+    ascending = np.argsort(areas, kind="stable")
+    for child in ascending:
+        if areas[child] == 0:
+            continue
+        pixels = np.flatnonzero(flat[child])
+        for parent in ascending:
+            if areas[parent] < areas[child] * minimum_growth:
+                continue
+            if flat[parent, pixels].sum() / areas[child] >= containment:
+                parents[child] = parent
+                break
+    return parents
+
+
+def build_hierarchy_region_maps(regions, size, image_area, fine_ratio=0.05, coarse_ratio=0.25,
+                                method="containment", return_parents=False):
+    """Build nested whole/part/subpart targets from mask containment.
+
+    This is an image-mask hierarchy inspired by LangSplat/LaGa, not SAGA's 3D
+    physical-scale gate. Area bins remain available only for a legacy ablation.
+    """
+    if method == "containment":
+        masks = np.stack([resize_mask(region["segmentation"], size) for region in regions])
+        parents = mask_containment_parents(masks)
+        fine = build_region_map(regions, size)
+        ancestors = np.zeros((3, len(regions)), dtype=np.int32)
+        for index in range(len(regions)):
+            chain = [index]
+            while parents[chain[-1]] >= 0:
+                chain.append(int(parents[chain[-1]]))
+            ancestors[:, index] = [chain[-1], chain[len(chain) // 2], index]
+        maps = np.full((3, *fine.shape), -1, dtype=np.int16)
+        valid = fine >= 0
+        ys, xs = np.nonzero(valid)
+        for level in range(3):
+            assigned = ancestors[level, fine[valid]]
+            # A near-containment relation may exclude a few edge pixels. Never
+            # supervise them with a parent mask that does not actually cover it.
+            maps[level, valid] = np.where(masks[assigned, ys, xs], assigned, fine[valid])
+        return (maps, parents) if return_parents else maps
+    if method != "area":
+        raise ValueError("Unknown hierarchy method")
     levels = [[], [], []]
     for index, region in enumerate(regions):
         ratio = float(region["area"]) / max(float(image_area), 1.0)
         level = 2 if ratio < fine_ratio else (1 if ratio < coarse_ratio else 0)
         levels[level].append(index)
-    return np.stack(
+    maps = np.stack(
         [build_region_map(regions, size, indices) for indices in levels], axis=0
     )
+    return (maps, np.full(len(regions), -1, dtype=np.int32)) if return_parents else maps
+
+
+def supported_prototype_assignments(features, centers, labels, fit_mask, view_ids=None,
+                                    min_similarity=0.0, min_margin=0.0, min_views=1):
+    """Reject ambiguous/single-view appearance pooling without selecting a label."""
+    similarity = np.sum(features * centers[labels], axis=1)
+    supported = similarity >= min_similarity
+    if min_margin > 0:
+        similarities = features @ centers.T
+        similarities[np.arange(len(features)), labels] = -np.inf
+        supported &= similarity - similarities.max(axis=1) >= min_margin
+    if min_views > 1:
+        if view_ids is None or len(view_ids) != len(features):
+            raise ValueError("Conservative prototype pooling requires per-region view identities")
+        view_ids = np.asarray(view_ids)
+        view_counts = np.array([len(np.unique(view_ids[(labels == cluster) & fit_mask]))
+                                for cluster in range(len(centers))])
+        supported &= view_counts[labels] >= min_views
+    return supported
 
 
 def aggregate_cross_view_features(
     features, confidences, max_prototypes=64, weight=0.65,
-    return_centers=False, fit_mask=None,
+    return_centers=False, fit_mask=None, view_ids=None,
+    min_similarity=0.0, min_margin=0.0, min_views=1, max_blend=1.0,
 ):
     """Fit scene prototypes on training regions, then transform every view."""
     features = np.asarray(features, dtype=np.float32)
@@ -92,7 +198,7 @@ def aggregate_cross_view_features(
     fit_features = features[fit_mask]
     if len(fit_features) < 2 or max_prototypes < 1 or weight <= 0:
         result = (
-            features.copy(), np.zeros(len(features), dtype=np.int32),
+            features.copy(), np.full(len(features), -1, dtype=np.int32),
             np.zeros(len(features), dtype=np.float32),
         )
         if return_centers:
@@ -119,10 +225,17 @@ def aggregate_cross_view_features(
     blend = float(weight) * np.clip(
         similarity * compactness[labels] * confidences, 0.0, 1.0
     )
+    blend = np.minimum(blend, float(max_blend))
+    supported = supported_prototype_assignments(
+        features, centers, labels, fit_mask, view_ids, min_similarity, min_margin, min_views,
+    )
+    blend[~supported] = 0
     aggregated = (1.0 - blend[:, None]) * features + blend[:, None] * centers[labels]
     aggregated /= np.maximum(np.linalg.norm(aggregated, axis=1, keepdims=True), 1e-8)
+    safe_labels = labels.astype(np.int32)
+    safe_labels[~supported] = -1
     result = (
-        aggregated.astype(np.float32), labels.astype(np.int32),
+        aggregated.astype(np.float32), safe_labels,
         blend.astype(np.float32),
     )
     return (*result, centers) if return_centers else result
@@ -265,6 +378,9 @@ def load_inventory_candidates(repo, inline="", path=""):
 
 
 def main():
+    import torch
+    from tqdm import tqdm
+
     parser = ArgumentParser(description="Prepare semantic supervision for 3DGS")
     parser.add_argument("--scene", required=True, help="COLMAP scene root containing images/")
     parser.add_argument("--images_subdir", default="images")
@@ -281,6 +397,10 @@ def main():
     parser.add_argument("--min_mask_area", type=int, default=100)
     parser.add_argument("--max_masks", type=int, default=128)
     parser.add_argument("--points_per_side", type=int, default=24)
+    parser.add_argument("--sam_crop_n_layers", type=int, default=1,
+                        help="SAM crop pyramid depth; 1 improves small-region proposals at additional preprocessing cost")
+    parser.add_argument("--mask_selection", choices=["balanced", "largest"], default="balanced")
+    parser.add_argument("--hierarchy_method", choices=["containment", "area"], default="containment")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument(
         "--sam_confidence_power", type=float, default=0.5,
@@ -314,6 +434,8 @@ def main():
     parser.add_argument("--background_area_ratio", type=float, default=0.80)
     parser.add_argument("--cross_view_prototypes", type=int, default=96)
     parser.add_argument("--cross_view_weight", type=float, default=0.72)
+    parser.add_argument("--prototype_mode", choices=["conservative", "off", "legacy"], default="conservative",
+                        help="Conservative appearance pooling is not geometric object correspondence")
     parser.add_argument("--boundary_width", type=int, default=3)
     parser.add_argument("--boundary_boost", type=float, default=2.25)
     parser.add_argument("--thin_boost", type=float, default=1.50)
@@ -336,6 +458,8 @@ def main():
         parser.error("--feature_dim must be at least 3")
     if args.feature_width < 32 or args.max_masks < 1 or args.batch_size < 1:
         parser.error("feature width, max masks, and batch size must be positive")
+    if args.sam_crop_n_layers < 0 or args.max_masks > np.iinfo(np.int16).max:
+        parser.error("SAM crop layers must be nonnegative and max_masks must fit int16 region IDs")
     if args.importance_topk < 0:
         parser.error("--importance_topk must be >= 0")
     if not 0 < args.fine_area_ratio < args.coarse_area_ratio < args.background_area_ratio <= 1:
@@ -402,6 +526,7 @@ def main():
     generator = SamAutomaticMaskGenerator(
         sam, points_per_side=args.points_per_side,
         pred_iou_thresh=0.7, stability_score_thresh=0.85,
+        crop_n_layers=args.sam_crop_n_layers, crop_n_points_downscale_factor=1,
         min_mask_region_area=args.min_mask_area,
     )
 
@@ -471,7 +596,14 @@ def main():
         rgb = np.asarray(Image.open(path).convert("RGB"))
         regions = generator.generate(rgb)
         regions = [region for region in regions if region["area"] >= args.min_mask_area]
-        regions = sorted(regions, key=lambda region: region["area"], reverse=True)[:args.max_masks]
+        proposal_count = len(regions)
+        if args.mask_selection == "balanced":
+            regions = select_balanced_regions(
+                regions, args.max_masks, rgb.shape[0] * rgb.shape[1],
+                args.fine_area_ratio, args.coarse_area_ratio,
+            )
+        else:
+            regions = sorted(regions, key=lambda region: region["area"], reverse=True)[:args.max_masks]
         if not regions:
             raise RuntimeError(f"SAM found no regions in {path}")
 
@@ -484,10 +616,12 @@ def main():
         scale = args.feature_width / rgb.shape[1]
         feature_size = (args.feature_width, max(1, round(rgb.shape[0] * scale)))
         region_map = build_region_map(regions, feature_size)
-        hierarchy_region_maps = build_hierarchy_region_maps(
+        hierarchy_region_maps, parent_ids = build_hierarchy_region_maps(
             regions, feature_size, rgb.shape[0] * rgb.shape[1],
             args.fine_area_ratio, args.coarse_area_ratio,
+            method=args.hierarchy_method, return_parents=True,
         )
+        region_masks = np.stack([resize_mask(region["segmentation"], feature_size) for region in regions])
         raw_path = raw_dir / f"{path.stem}.npz"
         np.savez_compressed(
             raw_path,
@@ -495,6 +629,12 @@ def main():
             hierarchy_region_maps=hierarchy_region_maps,
             features=features.astype(np.float16),
             confidences=confidences.astype(np.float16),
+            packed_region_masks=np.packbits(region_masks.reshape(len(regions), -1), axis=1),
+            mask_shape=np.asarray(region_map.shape, dtype=np.int32),
+            parent_ids=parent_ids,
+            image_name=np.asarray(path.name),
+            original_image_shape=np.asarray(rgb.shape[:2], dtype=np.int32),
+            proposal_count=np.asarray(proposal_count),
             area_ratios=np.asarray(
                 [region["area"] / (rgb.shape[0] * rgb.shape[1]) for region in regions],
                 dtype=np.float32,
@@ -558,15 +698,22 @@ def main():
     stacked_confidence = np.concatenate(
         [record["confidences"] for record in records], axis=0
     )
+    view_ids = np.concatenate([np.repeat(record["path"].name, len(record["features"])) for record in records])
+    prototype_guards = ({"view_ids": view_ids, "min_similarity": 0.90,
+                         "min_margin": 0.05, "min_views": 2, "max_blend": 0.20}
+                        if args.prototype_mode == "conservative" else {})
     stacked, prototype_ids, prototype_weights, prototype_centers = aggregate_cross_view_features(
         stacked_raw, stacked_confidence,
-        args.cross_view_prototypes, args.cross_view_weight, return_centers=True,
-        fit_mask=fit_mask,
+        args.cross_view_prototypes, 0.0 if args.prototype_mode == "off" else args.cross_view_weight,
+        return_centers=True, fit_mask=fit_mask, **prototype_guards,
     )
     dimensions = min(args.feature_dim, int(fit_mask.sum()), stacked.shape[1])
     if dimensions < 3:
         raise RuntimeError("Too few SAM regions to fit a semantic feature space")
-    pca, projected, feature_min, feature_max = fit_training_pca(stacked, dimensions, fit_mask)
+    # The language target remains the original mask descriptor. Appearance
+    # prototypes are an optional auxiliary/ablation, never the default teacher.
+    pca, projected, feature_min, feature_max = fit_training_pca(stacked_raw, dimensions, fit_mask)
+    aggregated_projected = pca.transform(stacked)
     feature_range = np.maximum(feature_max - feature_min, 1e-6)
     encoded_prototypes = (
         pca.transform(prototype_centers) - feature_min
@@ -584,14 +731,23 @@ def main():
         path = record["path"]
         confidences = record["confidences"]
         with np.load(record["raw_path"]) as raw:
-            region_map = raw["region_map"]
-            hierarchy_region_maps = raw["hierarchy_region_maps"]
+            raw_payload = {key: raw[key] for key in raw.files}
+        region_map = raw_payload["region_map"]
+        hierarchy_region_maps = raw_payload["hierarchy_region_maps"]
         count = len(record["features"])
         current_prototype_ids = prototype_ids[offset:offset + count]
         encoded = np.clip(
             (projected[offset:offset + count] - feature_min) / feature_range, 0.0, 1.0,
         )
         aggregated_features = stacked[offset:offset + count]
+        raw_payload.update(
+            aggregated_features=aggregated_features.astype(np.float16),
+            projected_features=projected[offset:offset + count].astype(np.float32),
+            aggregated_projected_features=aggregated_projected[offset:offset + count].astype(np.float32),
+            prototype_ids=current_prototype_ids.astype(np.int32),
+            prototype_blend=prototype_weights[offset:offset + count].astype(np.float32),
+        )
+        np.savez_compressed(record["raw_path"], **raw_payload)
         offset += count
         valid = region_map >= 0
         dense = np.zeros((*region_map.shape, dimensions), dtype=np.float32)
@@ -619,19 +775,19 @@ def main():
         normal_text = features_for_prompts(record["normal_prompts"])
         normal_regions = (
             select_prompt_regions(
-                aggregated_features, normal_text,
+                record["features"], normal_text,
                 args.importance_threshold, args.importance_topk,
             ) if normal_text is not None else object_like
         )
         normal_regions &= object_like
         background_regions = select_prompt_regions(
-            aggregated_features,
+            record["features"],
             features_for_prompts(record["background_prompts"]),
             args.importance_threshold, args.importance_topk,
         )
         normal_regions -= background_regions
         important_regions = select_prompt_regions(
-            aggregated_features,
+            record["features"],
             features_for_prompts(record["important_prompts"]),
             args.importance_threshold,
             args.importance_topk,
@@ -706,6 +862,11 @@ def main():
         fit_image_names=np.asarray(fit_image_names),
         heldout_image_names=np.asarray(heldout_image_names),
         fit_region_count=np.asarray(int(fit_mask.sum())),
+        teacher_preprocessing_version=np.asarray(2),
+        hierarchy_method=np.asarray(args.hierarchy_method),
+        prototype_mode=np.asarray(args.prototype_mode),
+        language_target=np.asarray("raw_CLIP_projected_training_PCA"),
+        prototype_clip_features=prototype_centers.astype(np.float32),
     )
     summary = {
         "images": len(paths), "regions": int(stacked.shape[0]),
@@ -722,9 +883,22 @@ def main():
         "background_prompts": background_prompts,
         "clip_model": args.clip_model, "clip_pretrained": args.clip_pretrained,
         "sam_model": args.sam_model,
+        "teacher_preprocessing": {
+            "version": 2, "crop": "full_mask_bbox_square_padding_white",
+            "mask_selection": args.mask_selection, "sam_crop_n_layers": args.sam_crop_n_layers,
+            "mask_resize": "positive_box_occupancy_when_downsampling",
+            "hierarchy_method": args.hierarchy_method,
+            "hierarchy_note": "2D mask containment, not SAGA 3D physical scale",
+            "importance_descriptors": "raw_unpooled_CLIP",
+            "language_target": "raw_CLIP_projected_training_PCA",
+            "raw_region_masks_saved": True,
+        },
         "mean_sam_confidence": float(np.mean(confidence_values)),
         "cross_view_prototypes": int(prototype_ids.max() + 1),
         "mean_prototype_blend": float(prototype_weights.mean()),
+        "prototype_mode": args.prototype_mode,
+        "prototype_supported_region_ratio": float(np.mean(prototype_ids >= 0)),
+        "prototype_guards": {key: value for key, value in prototype_guards.items() if key != "view_ids"},
         "boundary": {
             "width": args.boundary_width, "boost": args.boundary_boost,
         },
