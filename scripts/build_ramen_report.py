@@ -6,6 +6,8 @@ Example:
 
 Only ramen_final_report.md and ramen_evidence.json are written. Missing values
 stay pending; a training-log PSNR is never substituted for annotated evaluation.
+Optional eval_joint_descriptor_bank/metrics.json is shown in a separate appendix;
+its post-training costs/results never enter the main equal-time comparison.
 Optional audit_notes.json and cleanup_manifest.json may be placed in output_root
 or its parent (or report_dir). Audit notes can contain ``notes`` and
 ``training_log_observations``; a log observation needs metric/value/scope/source.
@@ -253,12 +255,80 @@ def tier_values(snapshot, name, tier):
             "gaussians": counts.get(tier) if isinstance(counts, dict) else None}
 
 
+def collect_descriptor_evaluation(root, reader):
+    """Read optional post-training retrieval evidence without changing main runs.
+
+    Wrapper measurements may include snapshots/polling and previous attempts;
+    they are never substituted for training_times.json or summed as total cost.
+    """
+    bases = [Path(root), Path(root) / "outputs_full"]
+    raw, source = reader.read([
+        base / "eval_joint_descriptor_bank" / "metrics.json" for base in bases])
+    state, state_source = reader.read([base / "monitored_state.json" for base in bases])
+    protocol = evaluation_protocol(raw)
+    is_bank = bool(source and protocol.get("score_mode") == "descriptor_bank")
+    if source and not is_bank:
+        reader.warnings.append(
+            "描述符库目录中的 metrics.json 未声明 score_mode=descriptor_bank；不将其数值作为描述符库结果展示。")
+    descriptor = protocol.get("descriptor_bank", {})
+    descriptor = descriptor if isinstance(descriptor, dict) else {}
+    construction = descriptor.get("construction", {})
+    construction = construction if isinstance(construction, dict) else {}
+    if is_bank and not descriptor.get("sha256"):
+        reader.warnings.append("描述符库评估缺少库文件 SHA-256，不能核验所评测库的身份。")
+    values = {key: value for key, value in raw.items() if number(value)} if is_bank else {}
+    per_label = raw.get("per_label_iou", {}) if is_bank else {}
+    per_label = {key: value for key, value in per_label.items() if number(value)} if isinstance(per_label, dict) else {}
+    boundary = raw.get("per_label_boundary_iou", {}) if is_bank else {}
+    boundary = {key: value for key, value in boundary.items() if number(value)} if isinstance(boundary, dict) else {}
+    rows = raw.get("rows", []) if is_bank else []
+    if isinstance(rows, list):
+        for label in per_label:
+            samples = [row["boundary_iou"] for row in rows if isinstance(row, dict)
+                       and row.get("label") == label and number(row.get("boundary_iou"))]
+            if label not in boundary and samples:
+                boundary[label] = sum(samples) / len(samples)
+    all_rgb = raw.get("all_test_rgb", {}) if is_bank else {}
+    if not isinstance(all_rgb, dict) or all_rgb.get("metric_scope") != "all_test_cameras":
+        if all_rgb:
+            reader.warnings.append("描述符库 all_test_rgb 未明确声明 all_test_cameras 范围，附表不采用其分数。")
+        all_rgb = {}
+    stages = state.get("stages", {})
+    stages = stages if isinstance(stages, dict) else {}
+    costs = {}
+    for name in ("descriptor_bank", "descriptor_evaluation"):
+        stage = stages.get(name, {})
+        stage = stage if isinstance(stage, dict) else {}
+        seconds = stage.get("observed_wrapper_seconds")
+        completed = type(stage.get("returncode")) is int and stage["returncode"] == 0
+        costs[name] = {
+            "observed_wrapper_seconds": seconds if completed and number(seconds) and seconds >= 0 else None,
+            "recorded_returncode": stage.get("returncode"), "log": stage.get("log"),
+        }
+    elapsed = construction.get("elapsed_seconds") if is_bank else None
+    costs["builder_recorded_seconds"] = elapsed if number(elapsed) and elapsed >= 0 else None
+    costs["source"] = state_source
+    costs["end_to_end_seconds"] = None
+    return {
+        "status": "core_metrics_recorded" if is_bank and all(key in values for key, _ in METRICS)
+        else "partial_metrics" if is_bank else "wrong_protocol" if source else "pending",
+        "excluded_from_main_comparison": True,
+        "excluded_from_main_equal_time_certification": True,
+        "metric_source": source, "values": values, "protocol": protocol,
+        "per_label_iou": per_label, "per_label_boundary_iou": boundary,
+        "all_test_rgb": all_rgb, "costs": costs,
+        "monitor_snapshot": {key: state[key] for key in (
+            "status", "stage", "computation_complete", "full_final_archive_completed") if key in state},
+    }
+
+
 def build_evidence(output_root, legacy_root=None, report_dir=None):
     reader = EvidenceReader()
     root = Path(output_root).resolve()
     report_dir = Path(report_dir or root / "report").resolve()
     current = collect_run(root, reader)
     legacy = collect_run(legacy_root, reader)
+    descriptor = collect_descriptor_evaluation(root, reader)
     optional_bases = list(dict.fromkeys([root, root.parent, report_dir]))
     audit, _ = reader.read([base / "audit_notes.json" for base in optional_bases])
     cleanup, _ = reader.read([base / "cleanup_manifest.json" for base in optional_bases])
@@ -275,10 +345,71 @@ def build_evidence(output_root, legacy_root=None, report_dir=None):
                 "joint_minus_sequential": compare_runs(current["runs"].get("joint"), current["runs"].get("sequential")),
                 "joint_minus_legacy_joint": compare_runs(current["runs"].get("joint"), legacy["runs"].get("joint")),
             }, "timing": timing_assessment(current), "audit_notes": audit,
+            "additional_evaluations": {"joint_descriptor_bank": descriptor},
             "training_log_observations": observations, "cleanup_manifest": cleanup,
             "inputs": reader.inputs, "warnings": reader.warnings,
             "artifacts": {"markdown": str(report_dir / "ramen_final_report.md"),
                           "evidence_json": str(report_dir / "ramen_evidence.json")}}
+
+
+def descriptor_appendix(evidence):
+    """No deltas or ranking: bank retrieval is a distinct, extra-cost protocol."""
+    bank = evidence.get("additional_evaluations", {}).get("joint_descriptor_bank", {})
+    lines = ["", "## 独立附表：联合模型＋训练后描述符库", "",
+             "这是额外的训练后构库与检索评估协议，不替换主表联合模型，不纳入主等时间比较，亦不自动计算相对基线的提升。构库、检索和额外评测成本需单独计入端到端预算。", ""]
+    if bank.get("status", "pending") in ("pending", "wrong_protocol"):
+        lines.append(PENDING + ("；文件存在但评分协议不是 descriptor_bank，未采用其分数。"
+                               if bank.get("status") == "wrong_protocol" else
+                               "；尚未读取到独立的 eval_joint_descriptor_bank/metrics.json。"))
+    else:
+        lines.extend(["以下仅是已记录分数；不表示新模型已优于基线，也不能由短训练连通测试证明质量。", "",
+                      "| 指标（标注视角） | 描述符库独立评估 |", "|---|---:|"])
+        for key, title in METRICS:
+            lines.append(f"| {title} | {display(bank.get('values', {}).get(key))} |")
+    protocol = bank.get("protocol", {})
+    descriptor = protocol.get("descriptor_bank", {})
+    descriptor = descriptor if isinstance(descriptor, dict) else {}
+    retrieval = descriptor.get("retrieval", {})
+    retrieval = retrieval if isinstance(retrieval, dict) else {}
+    construction = descriptor.get("construction", {})
+    construction = construction if isinstance(construction, dict) else {}
+    lines.extend(["", "| 记录项目 | 证据 |", "|---|---|"])
+    for title, value in (
+        ("独立指标文件", bank.get("metric_source")),
+        ("评分 / mask 协议", {key: protocol[key] for key in ("score_mode", "mask_metric_protocol", "score_space", "score_compositing") if key in protocol} or None),
+        ("最终二值 mask 阈值", protocol.get("threshold")),
+        ("固定粒度", protocol.get("granularity")),
+        ("Boundary 比例", protocol.get("boundary_ratio")),
+        ("候选检索参数（含独立文本门限）", retrieval or None),
+        ("标注重建视角", protocol.get("reconstruction_views") or None),
+        ("标注 mask 视角与类别", protocol.get("mask_views_and_labels") or None),
+        ("数据指纹", protocol.get("dataset_fingerprint")),
+        ("描述符库 SHA-256", descriptor.get("sha256")),
+        ("构库实际来源视角（记录值，非额外验证）", construction.get("source_views")),
+        ("构库采样参数", construction.get("sampling")),
+    ):
+        lines.append(f"| {title} | {cell(value) if value is not None else PENDING} |")
+    lines.extend(["", "最终 mask 阈值与候选 CLIP 文本门限含义不同；不得把不同评分协议、粒度或测试集调参后的数字视为同口径提升。", "",
+                  "| 类别 | 描述符库 IoU | 描述符库 Boundary-IoU |", "|---|---:|---:|"])
+    labels = sorted(set(bank.get("per_label_iou", {})) | set(bank.get("per_label_boundary_iou", {})))
+    for label in labels:
+        lines.append(f"| {cell(label)} | {display(bank.get('per_label_iou', {}).get(label))} | {display(bank.get('per_label_boundary_iou', {}).get(label))} |")
+    if not labels:
+        lines.append(f"| {PENDING} | — | — |")
+    all_rgb = bank.get("all_test_rgb", {})
+    lines.extend(["", "all-test RGB（独立范围，不替换标注视角指标）："
+                  f"视角数 {display(all_rgb.get('camera_count'))}；PSNR {display(all_rgb.get('psnr'))}；SSIM {display(all_rgb.get('ssim'))}。", "",
+                  "| 额外成本记录 | 秒数 |", "|---|---:|"])
+    costs = bank.get("costs", {})
+    lines.append(f"| 库内构建 elapsed_seconds（构库器记录） | {display(costs.get('builder_recorded_seconds'))} |")
+    for name, title in (("descriptor_bank", "构库阶段：监控最近成功记录的观测时长"),
+                        ("descriptor_evaluation", "库检索评估阶段：监控最近成功记录的观测时长")):
+        lines.append(f"| {title} | {display(costs.get(name, {}).get('observed_wrapper_seconds'))} |")
+    lines.extend([f"| 完整端到端额外成本 | {PENDING} |", "",
+                  "监控观测时长可能包含轮询和快照开销，不是纯 GPU 时间，也不能认作所有断点续跑尝试的累计时间；构库器耗时与监控构库耗时范围重叠，禁止相加。已有库跳过构建或没有完整记录时，未知成本不是零。主预算只使用 training_times.json 的完整训练阶段计时。", "",
+                  "监控状态只是报告生成时的快照，不据此断言之后的阶段已完成或完整权重已归档："
+                  + (cell(bank.get("monitor_snapshot")) if bank.get("monitor_snapshot") else PENDING) + "。"])
+    return lines
 
 
 def markdown_report(evidence):
@@ -354,8 +485,9 @@ def markdown_report(evidence):
     lines.extend(["", "## 训练用时与公平性", "",
                   evidence["timing"]["status"] + "。" + evidence["timing"]["reason"] + "。", "",
                   f"联合训练：{display(evidence['timing']['joint_seconds'])} 秒；顺序 RGB＋语义：{display(evidence['timing']['sequential_seconds'])} 秒；差值：{display(evidence['timing']['delta_seconds'], signed=True)} 秒。", "",
-                  "断点续训前的时长缺失、阶段未完成或仅传入 --equal_time 均不能认证等时间。预处理、评估、GPU型号与重复试验耗时需另外记录，阶段用时不自动等于端到端成本。", "",
-                  "## 审计限制与已知问题", ""])
+                  "断点续训前的时长缺失、阶段未完成或仅传入 --equal_time 均不能认证等时间。预处理、评估、GPU型号与重复试验耗时需另外记录，阶段用时不自动等于端到端成本。"])
+    lines.extend(descriptor_appendix(evidence))
+    lines.extend(["", "## 审计限制与已知问题", ""])
     notes = evidence["audit_notes"].get("notes", [])
     if isinstance(notes, (str, dict)):
         notes = [notes]

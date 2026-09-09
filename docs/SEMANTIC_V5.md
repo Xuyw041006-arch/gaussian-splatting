@@ -322,6 +322,10 @@ python -u -m scripts.run_v5_monitored_benchmark \
 备份状态分开记录；只有 `computation_complete` 为真且结果文件齐全才能说计算完成。
 Colab 限时/断连不会被这个脚本绕过；远端快照可减小损失，但不能保证云运行时无限持续。
 
+两个模型分别保留 latest 和实际存在的 `best_val_chkpnt.pth` 槽。恢复最优权重时，用
+该槽清单内嵌的 `validation_summary` 恢复对应摘要，避免备份失败后摘要已经更新而
+权重还停留在上一版。多份 checkpoint 需要额外容量；空间不足不会自动删除其他实验。
+
 历史二值 mask 可用 `scripts.score_saved_lerf_masks` 在 CPU 上按 GG-native 重计分。
 它不重推理、不改阈值、不改原预测，输出到新的 JSON。这一步用于区分计分变化和
 检索改进，不能据此声称模型重新训练提升。

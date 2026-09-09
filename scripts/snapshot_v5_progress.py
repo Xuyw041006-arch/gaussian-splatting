@@ -4,9 +4,12 @@ Restoration mapping is in snapshot_manifest.json: scene/* -> original scene,
 output/* -> original output_root, and checkpoints/MODEL/latest.pth ->
 output_root/MODEL/<original_name>. The third semantic_latest.pt slot maps to its
 recorded source_relative, together with its immutable dependency RGB PLY.
+Optional best_val_chkpnt.pth slots restore to the same name in each model
+directory; restore the validation summary embedded in that slot's manifest
+record, not a possibly newer loose output/MODEL/validation_summary.json.
 No source files or existing remote directories
 are deleted. Only manifest-owned slots may be replaced. DriveFS version/Trash
-accounting can still consume extra quota despite two visible checkpoint slots.
+accounting can still consume extra quota despite bounded visible checkpoint slots.
 """
 
 import argparse
@@ -190,6 +193,9 @@ def copy_managed(source, relative, destination, manifest, immutable=False, check
     if old and old["sha256"] == source_hash:
         if not current_matches(target, old):
             raise RuntimeError(f"Managed backup missing, truncated, or SHA mismatch: {target}")
+        if extra and any(old.get(key) != value for key, value in extra.items()):
+            manifest["files"][relative] = {**old, **extra}
+            save_manifest(destination, manifest)
         return
     if immutable and old:
         raise RuntimeError(f"Frozen teacher changed: {source}; old backup retained")
@@ -284,6 +290,39 @@ def small_metadata(scene, output):
     return selected
 
 
+def best_validation_metadata(path, model, output):
+    """Bind a stable selection summary to this best file, not a later version.
+
+    The trainer writes best first and summary second. If the summary is older,
+    wait for the next poll. Embed the consistent small summary in the manifest
+    so a quota failure cannot pair an old best slot with a newer loose JSON.
+    """
+    before = stamp(path)
+    expected = {"bytes": before["bytes"], "sha256": sha256(path)}
+    summary_path = output / model / "validation_summary.json"
+    summary, summary_hash = None, None
+    if summary_path.is_file():
+        try:
+            summary_before = stamp(summary_path)
+            payload = summary_path.read_bytes()
+            summary = json.loads(payload)
+            if (stamp(summary_path) != summary_before
+                or summary_before["mtime_ns"] < before["mtime_ns"]):
+                return None
+            summary_hash = hashlib.sha256(payload).hexdigest()
+        except (OSError, ValueError):
+            return None
+    if stamp(path) != before:
+        return None
+    return expected, {
+        "model": model, "stage": "best_validation", "original_name": path.name,
+        "source_relative": path.relative_to(output).as_posix(), "iteration": None,
+        "validation_summary_relative": f"{model}/validation_summary.json",
+        "validation_summary": summary, "validation_summary_sha256": summary_hash,
+        "note": "Restore the best checkpoint with this embedded validation_summary when available; a loose output summary may have advanced after a failed snapshot. Iteration is inside the checkpoint.",
+    }
+
+
 def snapshot(scene, output, destination):
     scene, output = Path(scene).resolve(), Path(output).resolve()
     destination_input = Path(destination).absolute()
@@ -335,6 +374,14 @@ def snapshot(scene, output, destination):
                                  extra={"model": model, "original_name": path.name, "iteration": step,
                                         "source_relative": path.relative_to(output).as_posix()})
                     break
+                best = safe_path(output, f"{model}/best_val_chkpnt.pth")
+                if best.is_file() and complete_torch_archive(best):
+                    best_metadata = best_validation_metadata(best, model, output)
+                    if best_metadata is not None:
+                        expected_best, extra_best = best_metadata
+                        copy_managed(best, f"checkpoints/{model}/best_val_chkpnt.pth",
+                                     destination, manifest, checkpoint=True,
+                                     extra=extra_best, expected=expected_best)
             semantic_candidates = sorted(
                 (int(match.group(1)), path)
                 for path in (output / "sequential/semantic").glob("iteration_*/semantic_checkpoint.pt")
@@ -375,7 +422,7 @@ def snapshot(scene, output, destination):
                 })
                 break
         manifest["last_success"] = utc()
-        manifest["storage_note"] = "Two RGB/joint slots plus one posthoc-semantic slot; Google Drive version/Trash quota and actual remote durability are not independently certified"
+        manifest["storage_note"] = "Two RGB/joint latest slots, up to two best-validation slots, and one posthoc-semantic slot; Google Drive version/Trash quota and actual remote durability are not independently certified"
         save_manifest(destination, manifest)
         return {"state": "snapshot_complete" if manifest["teacher"]["state"] == "complete" else "waiting_for_complete_teacher",
                 "destination": str(destination), "teacher": manifest["teacher"],

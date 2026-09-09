@@ -147,6 +147,95 @@ class RamenReportTests(unittest.TestCase):
         self.assertTrue(evidence["warnings"])
         json.dumps(evidence, allow_nan=False)
 
+    def bank_metrics(self):
+        metrics = self.metrics(35.0)
+        metrics.update(mean_iou=0.95, per_label_iou={"apple": 0.95})
+        metrics["protocol"] = {
+            "score_mode": "descriptor_bank", "mask_metric_protocol": "gg_native",
+            "descriptor_bank": {"sha256": "bank-hash", "retrieval": {"text_threshold": 0.5},
+                                "construction": {"elapsed_seconds": 12.0, "source_views": ["train_0"]}},
+        }
+        metrics["all_test_rgb"] = {"metric_scope": "all_test_cameras", "camera_count": 4,
+                                   "psnr": 36.0, "ssim": 0.98}
+        return metrics
+
+    def test_bank_is_independent_and_does_not_change_main_metrics_deltas_or_time(self):
+        self.write("eval_joint/metrics.json", self.metrics(30.25))
+        self.write("eval_sequential/metrics.json", self.metrics(30.0))
+        self.write("comparison.json", {"protocol": {"equal_wall_clock_requested": True}})
+        timings = {}
+        for name, seconds in (("joint_train_seconds", 100), ("sequential_rgb_seconds", 60),
+                              ("sequential_semantic_seconds", 40)):
+            timings.update({name: seconds, name + "_completed": True, name + "_timing_complete": True})
+        self.write("training_times.json", timings)
+        before = self.evidence()
+        source = self.write("eval_joint_descriptor_bank/metrics.json", self.bank_metrics())
+        self.write("monitored_state.json", {"status": "running", "stage": "report",
+                   "computation_complete": False, "full_final_archive_completed": False,
+                   "stages": {"descriptor_bank": {"returncode": 0, "observed_wrapper_seconds": 9000},
+                              "descriptor_evaluation": {"returncode": 0, "observed_wrapper_seconds": 5000}}})
+        after = self.evidence()
+        for key in ("current", "legacy", "comparisons", "timing"):
+            self.assertEqual(after[key], before[key])
+        bank = after["additional_evaluations"]["joint_descriptor_bank"]
+        self.assertTrue(bank["excluded_from_main_comparison"])
+        self.assertTrue(bank["excluded_from_main_equal_time_certification"])
+        self.assertEqual(bank["values"]["test_psnr"], 35.0)
+        self.assertEqual(bank["all_test_rgb"]["psnr"], 36.0)
+        self.assertEqual(bank["per_label_boundary_iou"]["apple"], 0.3)
+        self.assertIsNone(bank["costs"]["end_to_end_seconds"])
+        self.assertEqual(bank["costs"]["builder_recorded_seconds"], 12.0)
+        self.assertIn(str(source.resolve()), [item["path"] for item in after["inputs"]])
+        self.assertTrue(all(len(item["sha256"]) == 64 for item in after["inputs"]))
+        report = markdown_report(after)
+        self.assertIn("独立附表：联合模型＋训练后描述符库", report)
+        self.assertIn("不纳入主等时间比较", report)
+        self.assertIn("不是纯 GPU 时间", report)
+        self.assertIn("最终 mask 阈值与候选 CLIP 文本门限含义不同", report)
+        self.assertIn("完整端到端额外成本 | pending", report)
+        self.assertFalse(bank["monitor_snapshot"]["computation_complete"])
+
+    def test_missing_or_wrong_bank_protocol_does_not_reuse_main_result(self):
+        self.write("eval_joint/metrics.json", self.metrics())
+        missing = self.evidence()["additional_evaluations"]["joint_descriptor_bank"]
+        self.assertEqual(missing["status"], "pending")
+        self.assertEqual(missing["values"], {})
+        self.write("eval_joint_descriptor_bank/metrics.json", self.metrics(99.0))
+        evidence = self.evidence()
+        bank = evidence["additional_evaluations"]["joint_descriptor_bank"]
+        self.assertEqual(bank["status"], "wrong_protocol")
+        self.assertEqual(bank["values"], {})
+        self.assertNotIn("99.000000", markdown_report(evidence))
+        self.assertTrue(evidence["warnings"])
+
+    def test_incomplete_bank_cost_or_unknown_all_test_scope_stays_pending(self):
+        metrics = self.bank_metrics()
+        metrics["protocol"]["descriptor_bank"]["construction"]["elapsed_seconds"] = float("nan")
+        metrics["all_test_rgb"].pop("metric_scope")
+        self.write("outputs_full/eval_joint_descriptor_bank/metrics.json", metrics)
+        self.write("monitored_state.json", {"stages": {
+            "descriptor_bank": {"returncode": 1, "observed_wrapper_seconds": 60},
+            "descriptor_evaluation": {"observed_wrapper_seconds": 20}}})
+        evidence = self.evidence()
+        bank = evidence["additional_evaluations"]["joint_descriptor_bank"]
+        self.assertEqual(bank["all_test_rgb"], {})
+        self.assertIsNone(bank["costs"]["builder_recorded_seconds"])
+        for name in ("descriptor_bank", "descriptor_evaluation"):
+            self.assertIsNone(bank["costs"][name]["observed_wrapper_seconds"])
+        json.dumps(evidence, allow_nan=False)
+
+    def test_bank_report_regeneration_preserves_all_source_files(self):
+        metrics = self.write("eval_joint_descriptor_bank/metrics.json", self.bank_metrics())
+        state = self.write("monitored_state.json", {"status": "complete", "stages": {}})
+        saved = {path: path.read_bytes() for path in (metrics, state)}
+        args = ["--output_root", str(self.output), "--report_dir", str(self.report)]
+        main(args)
+        first = {path.name: path.read_bytes() for path in self.report.iterdir()}
+        main(args)
+        self.assertEqual(first, {path.name: path.read_bytes() for path in self.report.iterdir()})
+        self.assertEqual(saved, {path: path.read_bytes() for path in saved})
+        self.assertEqual(set(first), {"ramen_final_report.md", "ramen_evidence.json"})
+
 
 if __name__ == "__main__":
     unittest.main()

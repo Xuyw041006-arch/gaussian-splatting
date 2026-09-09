@@ -61,6 +61,7 @@ def main():
         parser.error("This experiment already has an active monitored session; do not start another")
     state_path = output / "monitored_state.json"
     git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+    previous = {}
     if state_path.exists():
         previous = json.loads(state_path.read_text())
         if previous.get("git_commit") != git_commit:
@@ -77,7 +78,8 @@ def main():
              "source_scene": str(scene), "output_root": str(output),
              "snapshot_dir": str(args.snapshot_dir.resolve()),
              "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-             "stages": {}, "computation_complete": False, "full_final_archive_completed": False}
+             "stages": previous.get("stages", {}), "stage_attempts": previous.get("stage_attempts", []),
+             "computation_complete": False, "full_final_archive_completed": False}
     snapshot_command = [sys.executable, "-u", "-m", "scripts.snapshot_v5_progress",
                         "--scene", str(scene), "--output_root", str(output),
                         "--destination", str(args.snapshot_dir)]
@@ -145,6 +147,8 @@ def main():
                 state["status"] = "interrupted_check_child_before_resume"
                 save_state(state_path, state)
                 raise
+        if name in state["stages"]:
+            state["stage_attempts"].append({"stage": name, **state["stages"][name]})
         state["stages"][name] = {"observed_wrapper_seconds": time.monotonic() - started,
                                  "returncode": process.returncode, "log": str(log)}
         state["status"] = "stage_done" if process.returncode == 0 else "failed"

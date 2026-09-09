@@ -161,6 +161,51 @@ class V5SnapshotTests(unittest.TestCase):
         result = self.run_snapshot()
         self.assertEqual(result["checkpoints"]["checkpoints/joint/latest.pth"]["iteration"], 1000)
 
+    def test_best_validation_slots_are_independent_and_keep_restore_names(self):
+        self.complete_teacher()
+        for model in ("joint", "sequential"):
+            checkpoint(self.output / model / "chkpnt2000.pth", 2)
+            checkpoint(self.output / model / "best_val_chkpnt.pth", 1)
+            (self.output / model / "validation_summary.json").write_text('{"best_iteration":1000}')
+        result = self.run_snapshot()
+        for model in ("joint", "sequential"):
+            latest = self.destination / f"checkpoints/{model}/latest.pth"
+            best = self.destination / f"checkpoints/{model}/best_val_chkpnt.pth"
+            self.assertEqual(snapshot.sha256(latest), snapshot.sha256(self.output / model / "chkpnt2000.pth"))
+            self.assertEqual(snapshot.sha256(best), snapshot.sha256(self.output / model / "best_val_chkpnt.pth"))
+            record = result["checkpoints"][f"checkpoints/{model}/best_val_chkpnt.pth"]
+            self.assertEqual(record["stage"], "best_validation")
+            self.assertEqual(record["source_relative"], f"{model}/best_val_chkpnt.pth")
+            self.assertEqual(record["validation_summary_relative"], f"{model}/validation_summary.json")
+            self.assertEqual(record["validation_summary"]["best_iteration"], 1000)
+            self.assertEqual(record["validation_summary_sha256"], snapshot.sha256(self.output / model / "validation_summary.json"))
+
+    def test_new_best_quota_failure_preserves_old_best_and_latest(self):
+        self.complete_teacher()
+        latest_source = self.output / "joint/chkpnt2000.pth"
+        best_source = self.output / "joint/best_val_chkpnt.pth"
+        checkpoint(latest_source, 2)
+        checkpoint(best_source, 1)
+        summary = self.output / "joint/validation_summary.json"
+        summary.write_text('{"best_iteration":1000}')
+        self.run_snapshot()
+        best_slot = self.destination / "checkpoints/joint/best_val_chkpnt.pth"
+        latest_slot = self.destination / "checkpoints/joint/latest.pth"
+        original_best, original_latest = snapshot.sha256(best_slot), snapshot.sha256(latest_slot)
+        checkpoint(best_source, 3)
+        summary.write_text('{"best_iteration":3000}')
+        with mock.patch.object(snapshot.shutil, "disk_usage", return_value=SimpleNamespace(free=0)):
+            with self.assertRaisesRegex(RuntimeError, "previous backup retained"):
+                self.run_snapshot()
+        self.assertEqual(snapshot.sha256(best_slot), original_best)
+        self.assertEqual(snapshot.sha256(latest_slot), original_latest)
+        self.assertTrue(best_source.is_file() and latest_source.is_file())
+        manifest = snapshot.read_json(self.destination / snapshot.MANIFEST)
+        self.assertEqual(manifest["files"]["checkpoints/joint/best_val_chkpnt.pth"]["validation_summary"]["best_iteration"], 1000)
+        best_source.write_bytes(b"incomplete-new-best")
+        self.run_snapshot()
+        self.assertEqual(snapshot.sha256(best_slot), original_best)
+
     def test_sequential_semantic_slot_preserves_rgb_and_records_geometry_dependency(self):
         self.complete_teacher()
         rgb = self.output / "sequential/chkpnt15000.pth"
