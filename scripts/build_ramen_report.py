@@ -171,6 +171,22 @@ def compare_runs(left, right):
     missing, mismatch = [], []
     if any(item.get("metric_origin") != "annotated_evaluator" for item in (left, right)):
         missing.append("双方原始 annotated evaluator metrics.json")
+    legacy_defaults = {
+        "score_mode": "legacy_pca_cosine", "mask_metric_protocol": "legacy",
+        "score_compositing": "clipped_per_gaussian_cosine_then_render",
+        "score_space": "centered_pca", "alpha_min": 0.0,
+        "boundary_pad_edges": False, "iou_aggregation": "mean_over_view_label_rows",
+        "layer_selection": "fixed_explicit_granularity_no_test_selection",
+    }
+    for key, default in legacy_defaults.items():
+        if lp.get(key, default) != rp.get(key, default):
+            mismatch.append(key)
+    for key in ("negative_prompts", "relevancy_temperature"):
+        if lp.get("score_mode") == "clip_relevancy" or rp.get("score_mode") == "clip_relevancy":
+            if lp.get(key) is None or rp.get(key) is None:
+                missing.append(key)
+            elif lp[key] != rp[key]:
+                mismatch.append(key)
     for key in ("reconstruction_views", "mask_views_and_labels", "threshold", "granularity"):
         if lp.get(key) is None or rp.get(key) is None or lp.get(key) == [] or rp.get(key) == []:
             missing.append(key)

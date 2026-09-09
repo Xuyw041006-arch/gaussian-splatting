@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-09",
+  "status": "v3_original_and_cleaned_joint_gpu_evaluations_complete",
+  "provenance": {
+    "kind": "key_fields_transcribed_from_live_colab_by_primary_agent",
+    "not_a_byte_for_byte_metrics_backup": true,
+    "colab_url": "https://colab.research.google.com/drive/1wKzHp5X7-cbd-7TkqKytJQOTBpITKKSU",
+    "metrics_path": "/content/ramen_eval_joint_v3/metrics.json",
+    "repository_commit": "ce01825",
+    "evaluator_sha256": "9073f97eb02e05b1d038141631f6ed5580bb50a13b42942e976a0f838b88988f",
+    "dataset_fingerprint": "881f73b83eca791a4c1d41021fb762c3ec732e39ae195436bab6269e9b44dbdb",
+    "metrics_file_sha256": null
+  },
+  "model": {
+    "run": "v3_joint_original",
+    "iteration_directory": 15000,
+    "gaussians": 1086937,
+    "best_checkpoint_selection_note": "Directory iteration alone does not certify a best-validation checkpoint."
+  },
+  "annotated_evaluation": {
+    "metric_scope": "annotated_test_mask_views",
+    "annotated_view_count": 3,
+    "annotated_camera_stems": ["test_0", "test_1", "test_2"],
+    "threshold": 0.25,
+    "granularity": 1,
+    "boundary_ratio": 0.008,
+    "test_psnr": 29.970945358276367,
+    "test_ssim": 0.9319233298301697,
+    "test_important_psnr": 32.677394231160484,
+    "mean_iou": 0.19296195402375138,
+    "mean_boundary_iou": 0.08031794884247767,
+    "per_label_iou": {
+      "chopsticks": 0.0,
+      "egg": 0.13197720761953663,
+      "glass of water": 0.2384179418710705,
+      "pork belly": 0.07571090416319871,
+      "wavy noodles in bowl": 0.13065957657852126,
+      "yellow bowl": 0.5810060939101812
+    }
+  },
+  "all_test_rgb": {
+    "metric_scope": "all_test_cameras",
+    "camera_count": 4,
+    "psnr": 30.279134273529053,
+    "ssim": 0.9348645359277725
+  },
+  "importance": {
+    "important_labels": ["egg", "pork belly", "wavy noodles in bowl"],
+    "normal_labels": ["yellow bowl", "chopsticks", "glass of water"],
+    "tier_gaussians": {"background": 5228, "normal": 311980, "important": 769729},
+    "derived_group_mean_iou": {"important": 0.11278256278708554, "normal": 0.2731413452604172, "background": null},
+    "derivation": "Unweighted arithmetic mean of the three reported per-label IoUs in each group. Internal tier counts may reflect the historical projection bug."
+  },
+  "model_postprocessing": {
+    "removed_gaussians": 447,
+    "removed_percent": 0.04112473860030526,
+    "retained_gaussians": 1086490,
+    "rendered_view_count": 4,
+    "visually_reviewed_views": [0, 2],
+    "visual_observation": "Primary agent observed very small differences and no obvious holes in main objects on views 0 and 2.",
+    "cleaned_same_protocol_evaluation": "complete",
+    "large_blur_resolution_claim": false,
+    "this_is_not_drive_file_cleanup": true
+  },
+  "cleaned_evaluation": {
+    "provenance": "Live Colab GPU evaluation read back by primary agent; full cleaned metrics file path not supplied in this snapshot.",
+    "gaussians": 1086490,
+    "dataset_fingerprint": "881f73b83eca791a4c1d41021fb762c3ec732e39ae195436bab6269e9b44dbdb",
+    "annotated_evaluation": {
+      "metric_scope": "annotated_test_mask_views",
+      "annotated_view_count": 3,
+      "threshold": 0.25,
+      "granularity": 1,
+      "boundary_ratio": 0.008,
+      "test_psnr": 29.968435287475586,
+      "test_ssim": 0.9319183031717936,
+      "test_important_psnr": 32.677394231160484,
+      "mean_iou": 0.19297549969343133,
+      "mean_boundary_iou": 0.08031477828652113
+    },
+    "all_test_rgb": {
+      "metric_scope": "all_test_cameras",
+      "camera_count": 4,
+      "psnr": 30.276599407196045,
+      "ssim": 0.9348596781492233
+    },
+    "tier_gaussians": {"background": 5226, "normal": 311535, "important": 769729},
+    "annotated_delta_clean_minus_original": {
+      "test_psnr": -0.00251007080078125,
+      "test_ssim": -0.00000502665837609495,
+      "test_important_psnr": 0.0,
+      "mean_iou": 0.000013545669679954075,
+      "mean_boundary_iou": -0.0000031705559565414765
+    },
+    "conclusion": "No major damage observed in this conservative cleanup; no clear sharpness improvement established."
+  },
+  "remote_evidence_bundle": {
+    "path": "/content/ramen_verified_results_2026-09-09.zip",
+    "remote_generation": "complete",
+    "bytes": 57883115,
+    "sha256": "e32bfedb64a779b4893ee3e53dc51158bb54450bad5714e0f0945120af5550c0",
+    "local_download_status": "not_confirmed",
+    "weights_upload_status": "not_confirmed"
+  },
+  "drive_cleanup": {
+    "permanently_deleted_items": 7,
+    "reported_total_size_gb": 5.689823195,
+    "confirmation": "Primary agent verified permanent-delete success in the Drive UI.",
+    "temporary_local_backups_retained": true,
+    "last_account_used_gb": 14.94,
+    "account_quota_refresh": "pending",
+    "per_file_manifest": "not_included_in_this_snapshot"
+  },
+  "verification": {"colab_tests_passed": 79, "test_elapsed_seconds": 1.322, "repository_commit": "0a8a9a3"},
+  "remaining": {
+    "v3_sequential_same_protocol_evaluation": "pending",
+    "v4_corrected_retraining": "not_started",
+    "equal_time_comparison": "not_certified",
+    "drive_cleanup_manifest": "not_available_in_this_snapshot"
+  }
+}

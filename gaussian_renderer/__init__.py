@@ -15,11 +15,14 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, clamp_output=True, detach_geometry=False):
     """
     Render the scene. 
     
-    Background tensor (bg_color) must be on GPU!
+    Background tensor (bg_color) must be on GPU! ``detach_geometry`` is for
+    feature-only supervision: colors retain gradients, geometry/opacity do not.
+    Signed affinity features must use ``clamp_output=False``; RGB defaults are
+    unchanged for existing checkpoints and callers.
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -66,6 +69,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
+
+    if detach_geometry:
+        means3D = means3D.detach()
+        means2D = means2D.detach()
+        opacity = opacity.detach()
+        scales = scales.detach() if scales is not None else None
+        rotations = rotations.detach() if rotations is not None else None
+        cov3D_precomp = cov3D_precomp.detach() if cov3D_precomp is not None else None
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -116,7 +127,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    rendered_image = rendered_image.clamp(0, 1)
+    if clamp_output:
+        rendered_image = rendered_image.clamp(0, 1)
     out = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,

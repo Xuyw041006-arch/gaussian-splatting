@@ -83,6 +83,17 @@ class RamenReportTests(unittest.TestCase):
         self.assertIn("test_psnr", result["deltas"])
         self.assertNotIn("mean_boundary_iou", result["deltas"])
 
+    def test_same_numbers_or_threshold_do_not_make_different_scoring_protocols_comparable(self):
+        for changed in ({"score_mode": "clip_cosine"}, {"mask_metric_protocol": "gg_native"}, {"alpha_min": 0.01}):
+            with self.subTest(changed=changed):
+                left, right = self.metrics(), self.metrics()
+                left["protocol"] = changed
+                self.write("eval_joint/metrics.json", left)
+                self.write("eval_sequential/metrics.json", right)
+                result = self.evidence()["comparisons"]["joint_minus_sequential"]
+                self.assertEqual(result["status"], "protocol_mismatch")
+                self.assertEqual(result["deltas"], {})
+
     def test_requested_equal_time_without_complete_history_is_not_certified(self):
         self.write("comparison.json", {"protocol": {"equal_wall_clock": True}})
         self.write("training_times.json", {"joint_train_seconds": 100,

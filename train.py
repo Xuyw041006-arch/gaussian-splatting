@@ -75,6 +75,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    initial_rgb_ply = getattr(joint_args, "init_rgb_ply", "") if joint_args is not None else ""
+    if initial_rgb_ply:
+        if checkpoint:
+            raise ValueError("--init_rgb_ply and --start_checkpoint are mutually exclusive")
+        gaussians.load_ply(initial_rgb_ply)
+        gaussians.max_radii2D = torch.zeros_like(gaussians.get_xyz[:, 0])
+        # This is a new experiment, not a resume. Preserve only RGB geometry and
+        # appearance; training_setup below creates new optimizer/schedule state.
+        with open(os.path.join(dataset.model_path, "rgb_initialization.json"), "w", encoding="utf-8") as handle:
+            json.dump({
+                "source_ply": os.path.abspath(initial_rgb_ply),
+                "initial_iteration": 0, "optimizer_restored": False,
+                "semantic_weights_restored": False,
+                "pretrained_rgb": True,
+                "comparison_warning": "Not a from-scratch baseline; include source RGB training time in any timing comparison",
+            }, handle, indent=2)
+        print("Initialized pretrained RGB PLY with fresh optimizer and semantic fields; iteration restarts at 0.")
     gaussians.training_setup(opt)
     checkpoint_joint_state = None
     if checkpoint:
@@ -559,6 +576,26 @@ if __name__ == "__main__":
     parser.add_argument("--foreground_weight", type=float, default=4.0)
     parser.add_argument("--background_weight", type=float, default=0.25)
     parser.add_argument("--joint_semantics", action="store_true")
+    parser.add_argument(
+        "--init_rgb_ply", default="",
+        help="Initialize a NEW run from an RGB Gaussian PLY (matching SH degree), not optimizer/semantics; iteration starts at zero",
+    )
+    parser.add_argument(
+        "--semantic_protocol", choices=("legacy", "v5"), default="legacy",
+        help="v5 separates language distillation from hierarchical SAM affinity; never resume v3/v4 into v5",
+    )
+    parser.add_argument(
+        "--semantic_geometry_grad", action="store_true",
+        help="v5 ablation: let semantic losses update geometry too (default: RGB alone updates geometry)",
+    )
+    parser.add_argument("--affinity_dimensions", type=int, default=16)
+    parser.add_argument("--affinity_every", type=int, default=4)
+    parser.add_argument("--affinity_weight", type=float, default=0.05)
+    parser.add_argument("--affinity_samples", type=int, default=320)
+    parser.add_argument("--semantic_clip_cosine_weight", type=float, default=0.1)
+    parser.add_argument("--semantic_clip_cosine_every", type=int, default=8)
+    parser.add_argument("--semantic_region_balance_power", type=float, default=0.5)
+    parser.add_argument("--semantic_region_balance_cap", type=float, default=8.0)
     parser.add_argument("--semantic_dir", default="")
     parser.add_argument("--semantic_start", type=int, default=1000)
     parser.add_argument(
@@ -608,6 +645,13 @@ if __name__ == "__main__":
         metavar=("BACKGROUND", "NORMAL", "IMPORTANT"),
     )
     args = parser.parse_args(sys.argv[1:])
+    if args.init_rgb_ply:
+        if args.start_checkpoint:
+            parser.error("--init_rgb_ply cannot be combined with --start_checkpoint")
+        if not os.path.isfile(args.init_rgb_ply):
+            parser.error("--init_rgb_ply must name an existing Gaussian PLY")
+        if args.model_path and os.path.commonpath((os.path.abspath(args.init_rgb_ply), os.path.abspath(args.model_path))) == os.path.abspath(args.model_path):
+            parser.error("--init_rgb_ply requires a separate output directory; do not overwrite its source run")
     if args.sh_degree > 3 and not args.start_checkpoint:
         parser.error("The bundled CUDA rasterizer supports SH degree 0..3; use --sh_degree 3")
     if args.sh_degree < 0:
@@ -630,6 +674,15 @@ if __name__ == "__main__":
     if args.foreground_weight <= 0 or args.background_weight <= 0:
         parser.error("Importance weights must be positive")
     if args.joint_semantics:
+        if (
+            args.affinity_dimensions < 4 or args.affinity_dimensions % 4
+            or args.affinity_every < 1 or args.affinity_samples < 3
+            or args.affinity_weight < 0 or args.semantic_clip_cosine_weight < 0
+            or args.semantic_clip_cosine_every < 1
+            or not 0 <= args.semantic_region_balance_power <= 1
+            or args.semantic_region_balance_cap < 1
+        ):
+            parser.error("V5 affinity/cosine/region-balance parameters are invalid")
         positive = (
             list(args.rgb_tier_weights) + list(args.semantic_tier_weights)
             + list(args.tier_densify_multipliers)

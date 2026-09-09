@@ -8,6 +8,11 @@ import torch
 
 from gaussian_renderer import render
 from semantic.curriculum import cosine_ramp, curriculum_phase
+from semantic.v5 import (
+    affinity_prefix_dimensions, decoded_clip_cosine_loss,
+    hierarchical_affinity_loss, normalize_affinity_groups,
+    normalize_rendered_features, region_balance_weights,
+)
 from semantic.joint import (
     ScaleGate,
     boundary_alignment_loss,
@@ -46,7 +51,18 @@ class JointSemanticSupervisor:
         with np.load(meta_path) as loaded:
             self.meta = {key: loaded[key].copy() for key in loaded.files}
         self.dimensions = int(self.meta["pca_components"].shape[0])
-        gaussians.setup_joint_semantics(self.dimensions, args.semantic_lr)
+        self.v5 = getattr(args, "semantic_protocol", "legacy") == "v5"
+        self.affinity_dimensions = int(getattr(args, "affinity_dimensions", 16)) if self.v5 else 0
+        already_initialized = gaussians.has_joint_semantics
+        gaussians.setup_joint_semantics(
+            self.dimensions + self.affinity_dimensions, args.semantic_lr,
+        )
+        if self.v5 and not already_initialized:
+            # A separate raw signed field shares only lifecycle/optimizer storage
+            # with language logits, not channels or losses. Random initialization
+            # avoids zero-vector symmetry under cosine affinity supervision.
+            with torch.no_grad():
+                gaussians._semantic_features[:, self.dimensions:].normal_(0, 0.1)
         self.scale_gate = ScaleGate(self.dimensions).cuda()
         self.gate_optimizer = torch.optim.Adam(
             self.scale_gate.parameters(), lr=args.scale_gate_lr
@@ -58,6 +74,15 @@ class JointSemanticSupervisor:
         self.feature_range = torch.from_numpy(
             (self.meta["feature_max"] - self.meta["feature_min"]).astype(np.float32)
         ).cuda()
+        if self.v5:
+            self.pca_components = torch.from_numpy(self.meta["pca_components"].astype(np.float32)).cuda()
+            self.pca_mean = torch.from_numpy(self.meta["pca_mean"].astype(np.float32)).cuda()
+            print(
+                "Semantic protocol v5: independent language/affinity fields; "
+                f"semantic geometry gradients={bool(args.semantic_geometry_grad)}. "
+                "Legacy scale gate, prototype pull and language-instance contrastive "
+                "losses are disabled."
+            )
         self.prototype_features = None
         if "prototype_features" in self.meta:
             self.prototype_features = torch.from_numpy(
@@ -91,6 +116,8 @@ class JointSemanticSupervisor:
         model and camera have the same data/cross-view/boundary metrics at any step.
         The caller should run validation under torch.no_grad().
         """
+        if self.v5:
+            return self._compute_v5(camera, iteration, validation)
         path = self.map_path(camera)
         if iteration < self.args.semantic_start or not path.is_file():
             return None
@@ -249,6 +276,133 @@ class JointSemanticSupervisor:
         finally:
             camera.image_height, camera.image_width = original_size
 
+    def _compute_v5(self, camera, iteration, validation=False):
+        """Distill language and SAM hierarchy without contradictory objectives.
+
+        RGB geometry remains trainable by RGB loss. By default the noisy 2-D
+        semantic teacher updates feature fields only; geometry-coupled semantics
+        is an explicit ablation with a differentiable alpha denominator.
+        """
+        path = self.map_path(camera)
+        if iteration < self.args.semantic_start or not path.is_file():
+            return None
+        supervision = load_joint_map(str(path))
+        target = supervision["features"].cuda(non_blocking=True)
+        valid = supervision["valid"].cuda(non_blocking=True)
+        confidence = supervision["confidence"].cuda(non_blocking=True)
+        region_ids = supervision["region_ids"].cuda(non_blocking=True)
+        tiers = supervision["importance"].cuda(non_blocking=True)
+        detail = supervision["detail_weight"].cuda(non_blocking=True)
+        weights = confidence * tier_weights(tiers, self.args.semantic_tier_weights) * detail
+        weights *= region_balance_weights(
+            region_ids, valid, self.args.semantic_region_balance_power,
+            self.args.semantic_region_balance_cap,
+        )
+        hierarchy = supervision["hierarchy_region_ids"]
+        hierarchy = (
+            hierarchy.cuda(non_blocking=True) if hierarchy is not None
+            else region_ids.unsqueeze(0).expand(3, -1, -1)
+        )
+        # Full-vector cosine is periodic for training and deterministic for val.
+        use_cosine = self.args.semantic_clip_cosine_weight > 0 and (
+            validation or iteration % self.args.semantic_clip_cosine_every == 0
+        )
+        use_affinity = not validation and self.args.affinity_weight > 0 and (
+            iteration % self.args.affinity_every == 0
+        )
+        selected_chunks = semantic_chunk_indices(
+            self.dimensions, self.args.semantic_chunks_per_step, iteration,
+            validation=validation or use_cosine,
+        )
+        language = torch.sigmoid(self.gaussians._semantic_features[:, :self.dimensions])
+        detach_geometry = not self.args.semantic_geometry_grad
+        render_options = {"detach_geometry": detach_geometry, "clamp_output": False}
+        original_size = camera.image_height, camera.image_width
+        camera.image_height, camera.image_width = target.shape[-2:]
+        try:
+            alpha = render(
+                camera, self.gaussians, self.pipeline, self.background,
+                override_color=torch.ones_like(language[:, :3]), **render_options,
+            )["render"][:1]
+            coverage = alpha[0].detach() >= self.args.semantic_min_alpha
+            active = valid & coverage & (weights > 0)
+            if not active.any():
+                return None
+            boundary = region_boundaries(region_ids, valid)
+            data_losses, boundary_losses, widths, predictions, packages = [], [], [], [], []
+            for chunk in selected_chunks:
+                start, stop = 3 * chunk, min(3 * chunk + 3, self.dimensions)
+                width = stop - start
+                colors = torch.nn.functional.pad(language[:, start:stop], (0, 3 - width))
+                package = render(
+                    camera, self.gaussians, self.pipeline, self.background,
+                    override_color=colors, **render_options,
+                )
+                prediction = normalize_rendered_features(package["render"][:width], alpha)
+                error = (prediction - target[start:stop]).abs().mean(dim=0)
+                data_losses.append((error[active] * weights[active]).sum() / weights[active].sum().clamp_min(1e-8))
+                boundary_losses.append(boundary_alignment_loss(
+                    prediction, target[start:stop], boundary, active, weights,
+                ))
+                widths.append(width)
+                if use_cosine:
+                    predictions.append(prediction)
+                packages.append(package)
+            channel_weights = prediction.new_tensor(widths)
+            data_loss = (torch.stack(data_losses) * channel_weights).sum() / channel_weights.sum()
+            boundary_loss = (torch.stack(boundary_losses) * channel_weights).sum() / channel_weights.sum()
+            zero = data_loss.new_zeros(())
+            cosine_loss = decoded_clip_cosine_loss(
+                torch.cat(predictions), target, active, weights,
+                self.feature_min, self.feature_range, self.pca_components, self.pca_mean,
+                deterministic=validation,
+            ) if use_cosine else zero
+            affinity_loss, affinity_stats = zero, {"pairs": 0, "conflicting_pairs": 0}
+            if use_affinity:
+                affinity = normalize_affinity_groups(
+                    self.gaussians._semantic_features[:, self.dimensions:],
+                )
+                affinity_images = []
+                for start in range(0, self.affinity_dimensions, 3):
+                    width = min(3, self.affinity_dimensions - start)
+                    package = render(
+                        camera, self.gaussians, self.pipeline, self.background,
+                        override_color=torch.nn.functional.pad(affinity[:, start:start + width], (0, 3 - width)),
+                        **render_options,
+                    )
+                    affinity_images.append(normalize_rendered_features(package["render"][:width], alpha))
+                    packages.append(package)
+                affinity_loss, affinity_stats = hierarchical_affinity_loss(
+                    torch.cat(affinity_images), hierarchy, coverage,
+                    # Do not double-apply inverse-area balancing: affinity
+                    # sampling adds its own hierarchy-aware area correction.
+                    weights=confidence * tier_weights(tiers, self.args.semantic_tier_weights) * detail,
+                    samples=self.args.affinity_samples,
+                )
+            curriculum_weight = cosine_ramp(
+                iteration, self.args.semantic_start, self.args.semantic_ramp_iterations,
+            )
+            cosine_cadence = 1 if validation else self.args.semantic_clip_cosine_every
+            loss = float(curriculum_weight) * (
+                self.args.semantic_weight * data_loss
+                + self.args.semantic_boundary_weight * boundary_loss
+                + self.args.semantic_clip_cosine_weight * cosine_cadence * cosine_loss
+                + self.args.affinity_weight * self.args.affinity_every * affinity_loss
+            )
+            return {
+                "loss": loss, "data_loss": data_loss.detach(),
+                "boundary_loss": boundary_loss.detach(), "clip_cosine_loss": cosine_loss.detach(),
+                "affinity_loss": affinity_loss.detach(), "affinity_stats": affinity_stats,
+                "spatial_loss": zero, "cross_view_loss": zero, "contrastive_loss": zero,
+                "curriculum_weight": float(curriculum_weight),
+                "phase": curriculum_phase(iteration, self.args.semantic_start, self.args.semantic_ramp_iterations),
+                "packages": packages, "level": "language_base+independent_hierarchy",
+                "chunks": selected_chunks, "evaluated_dimensions": sum(widths),
+                "validation": bool(validation), "semantic_protocol": "v5",
+            }
+        finally:
+            camera.image_height, camera.image_width = original_size
+
     def step(self):
         self.gate_optimizer.step()
         self.gate_optimizer.zero_grad(set_to_none=True)
@@ -256,6 +410,9 @@ class JointSemanticSupervisor:
     def checkpoint_state(self):
         """State not owned by GaussianModel and needed for exact continuation."""
         return {
+            "semantic_protocol": "v5" if self.v5 else "legacy",
+            "language_dimensions": self.dimensions,
+            "affinity_dimensions": self.affinity_dimensions,
             "scale_gate": self.scale_gate.state_dict(),
             "gate_optimizer": self.gate_optimizer.state_dict(),
         }
@@ -263,6 +420,9 @@ class JointSemanticSupervisor:
     def restore_checkpoint_state(self, state):
         if not state:
             return
+        expected = "v5" if self.v5 else "legacy"
+        if state.get("semantic_protocol", "legacy") != expected:
+            raise ValueError("Cannot resume a different semantic protocol; use a separate v5 run directory")
         if "scale_gate" in state:
             self.scale_gate.load_state_dict(state["scale_gate"])
         if "gate_optimizer" in state:
@@ -279,7 +439,7 @@ class JointSemanticSupervisor:
             "version": 2,
             "training": "joint",
             "scene_iteration": int(iteration),
-            "features": self.gaussians.get_semantic_features.detach().half().cpu(),
+            "features": torch.sigmoid(self.gaussians._semantic_features[:, :self.dimensions]).detach().half().cpu(),
             "importance_score": self.gaussians.importance_score.detach().half().cpu(),
             "scale_gate": {
                 key: value.detach().cpu()
@@ -305,5 +465,22 @@ class JointSemanticSupervisor:
                 self.args.semantic_contrastive_weight
             ),
         }
+        if self.v5:
+            artifact.update({
+                "version": 5, "semantic_protocol": "v5",
+                "features": torch.sigmoid(self.gaussians._semantic_features[:, :self.dimensions]).detach().half().cpu(),
+                "affinity_features": normalize_affinity_groups(self.gaussians._semantic_features[:, self.dimensions:]).detach().half().cpu(),
+                "affinity_prefix_dimensions": affinity_prefix_dimensions(self.affinity_dimensions),
+                "affinity_level_order": ("coarse", "middle", "fine"),
+                "semantic_geometry_grad": bool(self.args.semantic_geometry_grad),
+                "semantic_clip_cosine_weight": float(self.args.semantic_clip_cosine_weight),
+                "semantic_clip_cosine_every": int(self.args.semantic_clip_cosine_every),
+                "affinity_weight": float(self.args.affinity_weight),
+                "affinity_every": int(self.args.affinity_every),
+                "semantic_cross_view_weight": 0.0,
+                "semantic_contrastive_weight": 0.0,
+                "language_target": "raw_base_pca_no_global_prototype_pull",
+            })
+            artifact.pop("scale_gate", None)
         torch.save(artifact, output)
         return output

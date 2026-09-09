@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import re
 from argparse import ArgumentParser
 from pathlib import Path
@@ -16,22 +17,77 @@ def mask_iou(prediction, target):
     return float(np.logical_and(prediction, target).sum() / max(int(union), 1))
 
 
-def mask_boundary(mask, dilation_ratio=0.008):
+def mask_boundary(mask, dilation_ratio=0.008, pad_edges=False):
     import cv2
     import numpy as np
 
     mask = np.asarray(mask, dtype=np.uint8)
     radius = max(1, int(round(dilation_ratio * np.hypot(*mask.shape))))
     kernel = np.ones((3, 3), dtype=np.uint8)
-    eroded = cv2.erode(mask, kernel, iterations=radius)
+    if pad_edges:
+        padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        eroded = cv2.erode(padded, kernel, iterations=radius)[1:-1, 1:-1]
+    else:
+        eroded = cv2.erode(mask, kernel, iterations=radius)
     return mask.astype(bool) & ~eroded.astype(bool)
 
 
-def boundary_iou(prediction, target, dilation_ratio=0.008):
+def boundary_iou(prediction, target, dilation_ratio=0.008, pad_edges=False):
     return mask_iou(
-        mask_boundary(prediction, dilation_ratio),
-        mask_boundary(target, dilation_ratio),
+        mask_boundary(prediction, dilation_ratio, pad_edges),
+        mask_boundary(target, dilation_ratio, pad_edges),
     )
+
+
+def evaluate_prediction_mask(prediction, rendered_target, native_target, protocol, boundary_ratio):
+    """Legacy metrics remain unchanged; GG-native uses original annotation pixels."""
+    import numpy as np
+    from PIL import Image
+
+    if protocol == "gg_native":
+        target = np.asarray(native_target) > 128
+        resized = Image.fromarray(np.asarray(prediction, dtype=np.uint8) * 255).resize(
+            (target.shape[1], target.shape[0]), Image.Resampling.NEAREST
+        )
+        prediction = np.asarray(resized) > 128
+    elif protocol == "legacy":
+        target = rendered_target
+    else:
+        raise ValueError(f"Unknown mask metric protocol: {protocol}")
+    return {"iou": mask_iou(prediction, target),
+            "boundary_iou": boundary_iou(prediction, target, boundary_ratio, protocol == "gg_native"),
+            "metric_width": int(target.shape[1]), "metric_height": int(target.shape[0])}
+
+
+def aggregate_mask_rows(rows, labels, protocol):
+    import numpy as np
+
+    per_label = {label: float(np.mean([row["iou"] for row in rows if row["label"] == label])) for label in labels}
+    per_boundary = {label: float(np.mean([row["boundary_iou"] for row in rows if row["label"] == label])) for label in labels}
+    return {
+        "per_label_iou": per_label, "per_label_boundary_iou": per_boundary,
+        "mean_iou": float(np.mean(list(per_label.values()))) if protocol == "gg_native" else float(np.mean([row["iou"] for row in rows])),
+        "mean_boundary_iou": float(np.mean(list(per_boundary.values()))) if protocol == "gg_native" else float(np.mean([row["boundary_iou"] for row in rows])),
+    }
+
+
+def render_semantic_feature_map(camera, gaussians, pipeline, background, encoded, alpha, render_function):
+    """Composite encoded feature channels first, then score pixels in CLIP space."""
+    import numpy as np
+    import torch
+
+    height, width = alpha.shape
+    dimensions = encoded.shape[1]
+    feature_map = np.empty((height, width, dimensions), dtype=np.float32)
+    with torch.no_grad():
+        for start in range(0, dimensions, 3):
+            size = min(3, dimensions - start)
+            colors = torch.zeros((len(encoded), 3), device=background.device)
+            colors[:, :size] = torch.from_numpy(encoded[:, start:start + size]).to(background.device)
+            rendered = render_function(camera, gaussians, pipeline, background, override_color=colors)["render"]
+            normalized = rendered[:size] / alpha.clamp_min(1e-4)
+            feature_map[:, :, start:start + size] = normalized.permute(1, 2, 0).cpu().numpy()
+    return feature_map
 
 
 def camera_for_split(cameras, split_name, camera_map=None):
@@ -202,9 +258,17 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--test_mask", required=True)
     parser.add_argument("--iteration", type=int, required=True)
-    parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Default .25 cosine or .5 clip_relevancy; never select using test masks")
+    parser.add_argument("--score_mode", choices=("legacy_pca_cosine", "clip_cosine", "clip_relevancy"), default="legacy_pca_cosine")
+    parser.add_argument("--mask_protocol", choices=("legacy", "gg_native"), default="legacy")
+    parser.add_argument("--negative_prompts", nargs="+", default=["object", "things", "stuff", "texture"])
+    parser.add_argument("--relevancy_temperature", type=float, default=10.0)
+    parser.add_argument("--alpha_min", type=float, default=None,
+                        help="Default zero in legacy scoring, 1e-4 for CLIP-space pixel scoring")
     parser.add_argument("--granularity", type=int, choices=[0, 1, 2], default=1)
-    parser.add_argument("--boundary_ratio", type=float, default=0.008)
+    parser.add_argument("--boundary_ratio", type=float, default=None,
+                        help="Default .008 legacy; .02 GG-native protocol")
     parser.add_argument("--important_labels", default="")
     parser.add_argument("--normal_labels", default="")
     parser.add_argument("--output", default="")
@@ -213,6 +277,12 @@ def main():
     parser.add_argument("--all_test_rgb", action="store_true",
                         help="Also evaluate all test cameras under separate all_test_rgb fields")
     args = parser.parse_args()
+    if args.threshold is None:
+        args.threshold = 0.5 if args.score_mode == "clip_relevancy" else 0.25
+    if args.boundary_ratio is None:
+        args.boundary_ratio = 0.02 if args.mask_protocol == "gg_native" else 0.008
+    if args.alpha_min is None:
+        args.alpha_min = 0.0 if args.score_mode == "legacy_pca_cosine" else 1e-4
 
     model_path = Path(args.model).resolve()
     test_mask_root = Path(args.test_mask).resolve()
@@ -221,8 +291,18 @@ def main():
     )
     if not artifact_path.is_file() or not test_mask_root.is_dir():
         parser.error("Missing semantic artifact or LERF-Mask directory")
-    if args.iteration < 1 or not 0 <= args.threshold <= 1 or args.boundary_ratio <= 0:
+    if (args.iteration < 1 or not 0 <= args.threshold <= 1 or args.boundary_ratio <= 0
+            or not all(math.isfinite(x) for x in (args.threshold, args.boundary_ratio, args.alpha_min, args.relevancy_temperature))
+            or not 0 <= args.alpha_min <= 1 or args.relevancy_temperature <= 0):
         parser.error("iteration must be positive, threshold within [0,1], and boundary_ratio positive")
+    suffix = "" if (args.score_mode, args.mask_protocol) == ("legacy_pca_cosine", "legacy") else f"_{args.score_mode}_{args.mask_protocol}"
+    output_dir = Path(args.output).resolve() if args.output else model_path / ("lerf_mask_eval" + suffix)
+    if (output_dir / "metrics.json").is_file():
+        previous = json.loads((output_dir / "metrics.json").read_text())
+        old_protocol = previous.get("protocol", {})
+        if (old_protocol.get("score_mode", "legacy_pca_cosine") != args.score_mode
+                or old_protocol.get("mask_metric_protocol", "legacy") != args.mask_protocol):
+            parser.error("Use a separate --output directory for each score/mask protocol; do not overwrite legacy results")
     try:
         splits = mask_splits(test_mask_root)
         camera_map = json.loads(Path(args.camera_map).read_text()) if args.camera_map else None
@@ -238,7 +318,7 @@ def main():
     from gaussian_renderer import render
     from interactive_renderer import extract_dataset_and_pipeline, read_model_config
     from scene import GaussianModel, Scene
-    from semantic.artifact import apply_scale_gate, cosine_scores, decode_features, project_clip_feature
+    from semantic.artifact import apply_scale_gate, cosine_scores, decode_features, project_clip_feature, text_retrieval_scores
     from utils.image_utils import psnr
     from utils.loss_utils import ssim
 
@@ -262,9 +342,7 @@ def main():
     if len(encoded) != gaussians.get_xyz.shape[0]:
         raise RuntimeError("RGB and semantic Gaussian counts do not match")
     encoded = apply_scale_gate(encoded, artifact, args.granularity)
-    decoded = decode_features(
-        encoded, artifact["feature_min"].numpy(), artifact["feature_max"].numpy()
-    )
+    decoded = decode_features(encoded, artifact["feature_min"].numpy(), artifact["feature_max"].numpy()) if args.score_mode == "legacy_pca_cosine" else None
 
     try:
         import open_clip
@@ -279,20 +357,20 @@ def main():
     tokenizer = open_clip.get_tokenizer(artifact["clip_model"])
 
     labels = sorted({path.stem for split in splits for path in split.glob("*.png")})
+    phrases = labels + (args.negative_prompts if args.score_mode == "clip_relevancy" else [])
     with torch.no_grad():
         text = torch.nn.functional.normalize(
-            clip_model.encode_text(tokenizer(labels).to(device)).float(), dim=-1
+            clip_model.encode_text(tokenizer(phrases).to(device)).float(), dim=-1
         ).cpu().numpy()
     queries = np.stack([
         project_clip_feature(
             feature, artifact["pca_mean"].numpy(), artifact["pca_components"].numpy()
-        ) for feature in text
+        ) for feature in text[:len(labels)]
     ])
     scores = {
         label: cosine_scores(decoded, query) for label, query in zip(labels, queries)
-    }
+    } if args.score_mode == "legacy_pca_cosine" else {}
 
-    output_dir = Path(args.output).resolve() if args.output else model_path / "lerf_mask_eval"
     output_dir.mkdir(parents=True, exist_ok=True)
     important_labels = {
         value.strip() for value in args.important_labels.split(",") if value.strip()
@@ -309,9 +387,11 @@ def main():
     for split in splits:
         camera = split_cameras[split.name]
         target_masks = {}
+        native_masks = {}
         mask_sources = {}
         for target_path in sorted(split.glob("*.png")):
             with Image.open(target_path) as source_image:
+                native_masks[target_path.stem] = np.asarray(source_image.convert("L")).copy()
                 mask_sources[target_path.stem] = {
                     "source_size": list(source_image.size), "sha256": file_sha256(target_path),
                 }
@@ -367,16 +447,28 @@ def main():
                     (len(encoded), 3), dtype=torch.float32, device="cuda"
                 ),
             )["render"][0].clamp(0, 1)
+        pixel_scores = None
+        if args.score_mode != "legacy_pca_cosine":
+            feature_map = render_semantic_feature_map(camera, gaussians, pipeline, background, encoded, alpha, render)
+            pixel_decoded = decode_features(feature_map.reshape(-1, encoded.shape[1]), artifact["feature_min"].numpy(), artifact["feature_max"].numpy())
+            pixel_scores = text_retrieval_scores(
+                pixel_decoded, text[:len(labels)], artifact["pca_mean"].numpy(), artifact["pca_components"].numpy(),
+                mode=args.score_mode, negative_text=text[len(labels):], temperature=args.relevancy_temperature,
+            ).reshape(camera.image_height, camera.image_width, len(labels))
+            del feature_map, pixel_decoded
+        alpha_valid = (alpha >= args.alpha_min).cpu().numpy()
         for target_path in sorted(split.glob("*.png")):
             label = target_path.stem
-            values = torch.from_numpy(scores[label]).float().cuda()
-            colors = values[:, None].repeat(1, 3).clamp(0, 1)
-            with torch.no_grad():
-                score_render = render(
-                    camera, gaussians, pipeline, background, override_color=colors
-                )["render"][0]
-                score_render = score_render / alpha.clamp_min(1e-4)
-            prediction = (score_render >= args.threshold).cpu().numpy()
+            if args.score_mode == "legacy_pca_cosine":
+                values = torch.from_numpy(scores[label]).float().cuda()
+                colors = values[:, None].repeat(1, 3).clamp(0, 1)
+                with torch.no_grad():
+                    score_render = render(camera, gaussians, pipeline, background, override_color=colors)["render"][0]
+                    score_render = score_render / alpha.clamp_min(1e-4)
+                score_array = score_render.cpu().numpy()
+            else:
+                score_array = pixel_scores[:, :, labels.index(label)]
+            prediction = (score_array >= args.threshold) & alpha_valid
             target = target_masks[label]
             Image.fromarray(prediction.astype(np.uint8) * 255).save(
                 output_dir / f"{split.name}_{label}.png"
@@ -391,14 +483,27 @@ def main():
                 "label": label,
                 "width": int(camera.image_width), "height": int(camera.image_height),
                 "visualizations": visualizations,
-                "iou": mask_iou(prediction, target),
-                "boundary_iou": boundary_iou(
-                    prediction, target, args.boundary_ratio
-                ),
+                **evaluate_prediction_mask(prediction, target, native_masks[label], args.mask_protocol, args.boundary_ratio),
+                "score_min": float(score_array[alpha_valid].min()) if alpha_valid.any() else None,
+                "score_max": float(score_array[alpha_valid].max()) if alpha_valid.any() else None,
+                "prediction_pixels": int(prediction.sum()), "target_pixels_render_size": int(target.sum()),
             })
 
     protocol = protocol_metadata(protocol_views, [camera.image_name for camera in cameras],
                                  args.threshold, args.granularity, args.boundary_ratio)
+    protocol.update({
+        "score_mode": args.score_mode, "mask_metric_protocol": args.mask_protocol,
+        "negative_prompts": args.negative_prompts if args.score_mode == "clip_relevancy" else [],
+        "relevancy_temperature": args.relevancy_temperature if args.score_mode == "clip_relevancy" else None,
+        "alpha_min": args.alpha_min,
+        "score_compositing": "clipped_per_gaussian_cosine_then_render" if args.score_mode == "legacy_pca_cosine" else "render_encoded_features_then_clip_space_score",
+        "score_space": "centered_pca" if args.score_mode == "legacy_pca_cosine" else "pca_reconstructed_clip",
+        "mask_resize": "prediction_nearest_to_native_gt" if args.mask_protocol == "gg_native" else "nearest_to_evaluated_rgb_dimensions",
+        "mask_foreground": "uint8 > 128" if args.mask_protocol == "gg_native" else "uint8 > 0",
+        "boundary_pad_edges": args.mask_protocol == "gg_native",
+        "iou_aggregation": "macro_mean_over_labels" if args.mask_protocol == "gg_native" else "mean_over_view_label_rows",
+        "layer_selection": "fixed_explicit_granularity_no_test_selection",
+    })
     result = {
         "model": str(model_path),
         "iteration": args.iteration,
@@ -410,20 +515,17 @@ def main():
         "dataset_fingerprint": protocol["dataset_fingerprint"],
         "protocol": protocol,
         "weight_selection": weight_selection(model_path, args.iteration, artifact_path),
+        "semantic_artifact": {
+            "version": artifact.get("version"),
+            "semantic_protocol": artifact.get("semantic_protocol", "legacy_unrecorded"),
+            "language_granularity": "saved_scale_gate" if "scale_gate" in artifact else "single_language_field_no_scale_gate",
+            "has_independent_affinity": "affinity_features" in artifact,
+        },
         "important_labels": sorted(important_labels), "normal_labels": sorted(normal_labels),
         "gaussians": int(len(encoded)),
         "test_psnr": float(np.mean([row["psnr"] for row in reconstruction_rows])),
         "test_ssim": float(np.mean([row["ssim"] for row in reconstruction_rows])),
-        "mean_iou": float(np.mean([row["iou"] for row in rows])),
-        "mean_boundary_iou": float(np.mean([row["boundary_iou"] for row in rows])),
-        "per_label_iou": {
-            label: float(np.mean([row["iou"] for row in rows if row["label"] == label]))
-            for label in labels
-        },
-        "per_label_boundary_iou": {
-            label: float(np.mean([row["boundary_iou"] for row in rows if row["label"] == label]))
-            for label in labels
-        },
+        **aggregate_mask_rows(rows, labels, args.mask_protocol),
         "reconstruction_rows": reconstruction_rows,
         "rows": rows,
     }

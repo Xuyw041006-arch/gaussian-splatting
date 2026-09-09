@@ -1,7 +1,6 @@
 """Search all trained Gaussians with an open-vocabulary text prompt."""
 
 import json
-import os
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -10,7 +9,8 @@ import torch
 from plyfile import PlyData, PlyElement
 
 from semantic.artifact import (
-    apply_scale_gate, cosine_scores, decode_features, project_clip_feature, select_indices,
+    apply_scale_gate, decode_features, select_indices,
+    DEFAULT_NEGATIVE_PROMPTS, SCORE_MODES, text_retrieval_scores, affinity_point_scores,
 )
 
 
@@ -38,9 +38,16 @@ def save_filtered_ply(source_path, destination_path, indices):
 def main():
     parser = ArgumentParser(description="Open-vocabulary query over semantic 3D Gaussians")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--text", required=True)
+    prompt = parser.add_mutually_exclusive_group(required=True)
+    prompt.add_argument("--text")
+    prompt.add_argument("--affinity_point_index", type=int,
+                        help="v5 hierarchy query from a picked Gaussian index, without CLIP")
     parser.add_argument("--iteration", type=int, default=-1)
-    parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Defaults: cosine .25, clip_relevancy .5, point affinity .7; different score scales")
+    parser.add_argument("--score_mode", choices=SCORE_MODES, default="legacy_pca_cosine")
+    parser.add_argument("--negative_prompts", nargs="+", default=list(DEFAULT_NEGATIVE_PROMPTS))
+    parser.add_argument("--relevancy_temperature", type=float, default=10.0)
     parser.add_argument("--granularity", type=int, choices=[0, 1, 2], default=1)
     parser.add_argument("--top_k", type=int, default=0, help="0 keeps every match")
     parser.add_argument("--output", default="selection.npz")
@@ -48,6 +55,14 @@ def main():
     parser.add_argument("--export_selected", default="")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.threshold is None:
+        args.threshold = 0.7 if args.affinity_point_index is not None else 0.5 if args.score_mode == "clip_relevancy" else 0.25
+    if not np.isfinite(args.relevancy_temperature) or args.relevancy_temperature <= 0:
+        parser.error("relevancy_temperature must be finite and positive")
+    if not np.isfinite(args.threshold) or not -1 <= args.threshold <= 1 or args.top_k < 0:
+        parser.error("threshold must be finite within [-1,1], and top_k nonnegative")
+    if args.affinity_point_index is None and args.score_mode == "clip_relevancy" and args.threshold < 0:
+        parser.error("clip_relevancy threshold must be within [0,1]")
 
     model_path = Path(args.model).resolve()
     iteration = latest_iteration(model_path) if args.iteration < 0 else args.iteration
@@ -57,34 +72,42 @@ def main():
         parser.error(f"Missing semantic artifact or point cloud for iteration {iteration}")
 
     artifact = torch.load(artifact_path, map_location="cpu")
-    try:
-        import open_clip
-    except ImportError as error:
-        parser.error(f"Missing open-clip-torch: {error}")
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        parser.error("CUDA was requested but is unavailable; pass --device cpu for queries")
-    precision = "fp16" if device.type == "cuda" else "fp32"
-    clip_model, _, _ = open_clip.create_model_and_transforms(
-        artifact["clip_model"], pretrained=artifact["clip_pretrained"], precision=precision
-    )
-    clip_model = clip_model.eval().to(device)
-    tokenizer = open_clip.get_tokenizer(artifact["clip_model"])
-    with torch.no_grad():
-        query_512 = torch.nn.functional.normalize(
-            clip_model.encode_text(tokenizer([args.text]).to(device)).float(), dim=-1, p=2
-        )[0].cpu().numpy()
-
-    encoded = apply_scale_gate(
-        artifact["features"].float().numpy(), artifact, args.granularity
-    )
-    decoded = decode_features(
-        encoded, artifact["feature_min"].numpy(), artifact["feature_max"].numpy()
-    )
-    query = project_clip_feature(
-        query_512, artifact["pca_mean"].numpy(), artifact["pca_components"].numpy()
-    )
-    scores = cosine_scores(decoded, query)
+    if args.affinity_point_index is not None:
+        if "affinity_features" not in artifact or "affinity_prefix_dimensions" not in artifact:
+            parser.error("This artifact has no independent affinity hierarchy; use --text for legacy models")
+        try:
+            scores = affinity_point_scores(artifact["affinity_features"].float().numpy(), args.affinity_point_index,
+                                           artifact["affinity_prefix_dimensions"], args.granularity)
+        except ValueError as error:
+            parser.error(str(error))
+        args.score_mode = "affinity_cosine"
+        query_name = f"point:{args.affinity_point_index}"
+    else:
+        try:
+            import open_clip
+        except ImportError as error:
+            parser.error(f"Missing open-clip-torch: {error}")
+        device = torch.device(args.device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            parser.error("CUDA was requested but is unavailable; pass --device cpu for queries")
+        precision = "fp16" if device.type == "cuda" else "fp32"
+        clip_model, _, _ = open_clip.create_model_and_transforms(
+            artifact["clip_model"], pretrained=artifact["clip_pretrained"], precision=precision
+        )
+        clip_model = clip_model.eval().to(device)
+        tokenizer = open_clip.get_tokenizer(artifact["clip_model"])
+        phrases = [args.text] + (args.negative_prompts if args.score_mode == "clip_relevancy" else [])
+        with torch.no_grad():
+            text_features = torch.nn.functional.normalize(
+                clip_model.encode_text(tokenizer(phrases).to(device)).float(), dim=-1, p=2
+            ).cpu().numpy()
+        encoded = apply_scale_gate(artifact["features"].float().numpy(), artifact, args.granularity)
+        decoded = decode_features(encoded, artifact["feature_min"].numpy(), artifact["feature_max"].numpy())
+        scores = text_retrieval_scores(
+            decoded, text_features[:1], artifact["pca_mean"].numpy(), artifact["pca_components"].numpy(),
+            mode=args.score_mode, negative_text=text_features[1:], temperature=args.relevancy_temperature,
+        )[:, 0]
+        query_name = args.text
     indices = select_indices(scores, args.threshold, args.top_k)
 
     ply = PlyData.read(ply_path)
@@ -96,8 +119,13 @@ def main():
     xyz = np.column_stack([vertices[axis] for axis in ("x", "y", "z")])
     selected_xyz = xyz[indices]
     result = {
-        "query": args.text,
+        "query": query_name,
+        "affinity_point_index": args.affinity_point_index,
         "threshold": args.threshold,
+        "score_mode": args.score_mode,
+        "granularity": args.granularity,
+        "negative_prompts": args.negative_prompts if args.score_mode == "clip_relevancy" else [],
+        "relevancy_temperature": args.relevancy_temperature if args.score_mode == "clip_relevancy" else None,
         "matched_gaussians": int(len(indices)),
         "total_gaussians": int(len(scores)),
         "score_max": float(scores.max()) if len(scores) else None,
@@ -110,8 +138,9 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path, indices=indices.astype(np.int64), scores=scores[indices].astype(np.float32),
-        query=np.array(args.text), threshold=np.array(args.threshold),
+        query=np.array(query_name), threshold=np.array(args.threshold),
         scene_iteration=np.array(iteration),
+        score_mode=np.array(args.score_mode), granularity=np.array(args.granularity),
     )
     if args.export_selected:
         save_filtered_ply(ply_path, args.export_selected, indices)

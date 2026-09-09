@@ -164,7 +164,7 @@ def semantic_time_budget_complete(model, iteration, target):
     ) >= int(target)
 
 
-def detail_preprocessing_complete(scene, heldout_names=None):
+def detail_preprocessing_complete(scene, heldout_names=None, teacher_version=None):
     meta_path = Path(scene) / "semantic_meta.npz"
     maps = sorted((Path(scene) / "semantic_maps").glob("*.npz"))
     if not meta_path.is_file() or not maps:
@@ -172,6 +172,12 @@ def detail_preprocessing_complete(scene, heldout_names=None):
     try:
         import numpy as np
         with np.load(meta_path) as meta:
+            if teacher_version is not None and (
+                "teacher_preprocessing_version" not in meta.files
+                or int(meta["teacher_preprocessing_version"]) != teacher_version
+                or str(meta.get("hierarchy_method", "")) != "containment"
+            ):
+                return False
             if "prototype_features" not in meta.files:
                 return False
             if heldout_names is not None:
@@ -200,10 +206,13 @@ def main():
     parser.add_argument("--output_root", required=True)
     parser.add_argument("--iterations", type=int, default=15000)
     parser.add_argument("--semantic_iterations", type=int, default=5000)
-    parser.add_argument("--semantic_start", type=int, default=1000)
-    parser.add_argument("--semantic_ramp_iterations", type=int, default=2500)
+    parser.add_argument("--semantic_start", type=int, default=None)
+    parser.add_argument("--semantic_ramp_iterations", type=int, default=None)
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--feature_width", type=int, default=512)
+    parser.add_argument("--semantic_protocol", choices=["legacy", "v5"], default="legacy")
+    parser.add_argument("--prepare_only", action="store_true", help="Build the isolated teacher/split; do not train or evaluate")
+    parser.add_argument("--sam_crop_n_layers", type=int, default=1)
     parser.add_argument(
         "--joint_sh_degree", type=int, default=3, choices=range(4),
         help="New joint training SH degree supported by the stock CUDA rasterizer (0-3)",
@@ -231,6 +240,10 @@ def main():
         help="Reuse preprocessing, completed stages, and the latest training checkpoints",
     )
     args = parser.parse_args()
+    if args.semantic_start is None:
+        args.semantic_start = 2500 if args.semantic_protocol == "v5" else 1000
+    if args.semantic_ramp_iterations is None:
+        args.semantic_ramp_iterations = 2000 if args.semantic_protocol == "v5" else 2500
     if args.skip_baseline and args.skip_joint:
         parser.error("At least one of baseline or joint must be selected")
     if any(not 0 <= degree <= args.joint_sh_degree for degree in args.tier_sh_degrees):
@@ -252,6 +265,22 @@ def main():
     baseline = output_root / "sequential"
     joint = output_root / "joint"
     output_root.mkdir(parents=True, exist_ok=True)
+    protocol_file = output_root / "experiment_protocol.json"
+    recorded_protocol = load_json(protocol_file, {})
+    requested_protocol = {
+        "semantic_protocol": args.semantic_protocol, "scene": str(scene),
+        "iteration_cap": args.iterations, "semantic_start": args.semantic_start,
+        "semantic_ramp_iterations": args.semantic_ramp_iterations,
+        "feature_dim": args.feature_dim, "feature_width": args.feature_width,
+        "validation_views": args.validation_views,
+    }
+    if args.semantic_protocol == "v5":
+        existing_weights = list(output_root.glob("*/chkpnt*.pth")) + list(output_root.glob("*/point_cloud/iteration_*/*.ply"))
+        if existing_weights and recorded_protocol != requested_protocol:
+            parser.error("V5 cannot reuse unrecorded or different-protocol weights; choose a new output_root")
+        if (scene / "semantic_meta.npz").is_file() and not detail_preprocessing_complete(scene, teacher_version=2):
+            parser.error("V5 requires a new scene directory: refusing to overwrite legacy teacher supervision")
+        save_json(protocol_file, requested_protocol)
 
     test_images = sorted((scene / "images").glob("test_*.*"))
     if len(test_images) < 3:
@@ -280,7 +309,14 @@ def main():
     )
     print("Validation views:", [path.name for path in validation_images])
 
-    preprocessed = detail_preprocessing_complete(scene, [p.name for p in validation_images])
+    preprocessed = detail_preprocessing_complete(
+        scene, [p.name for p in validation_images],
+        teacher_version=2 if args.semantic_protocol == "v5" else None,
+    )
+    if args.semantic_protocol == "v5" and args.skip_preprocess and not preprocessed:
+        parser.error("V5 --skip_preprocess requires completed version-2 train-only containment teachers")
+    if args.semantic_protocol == "v5" and existing_weights and (not args.resume or not preprocessed):
+        parser.error("Existing V5 weights require --resume and intact teacher files; do not refit the embedding space")
     if not args.skip_preprocess and not (args.resume and preprocessed):
         run([
             sys.executable, repo / "preprocess_semantics.py",
@@ -295,7 +331,18 @@ def main():
             "--boundary_width", 3, "--boundary_boost", 2.25,
             "--thin_boost", 1.50, "--thin_compactness", 0.40,
             "--thin_aspect_ratio", 2.5,
+            *(["--hierarchy_method", "containment", "--mask_selection", "balanced",
+               "--sam_crop_n_layers", args.sam_crop_n_layers, "--prototype_mode", "off"]
+              if args.semantic_protocol == "v5" else []),
         ], repo)
+
+    if args.semantic_protocol == "v5":
+        from scripts.run_ramen_recovery import establish_semantic_reference
+        establish_semantic_reference(scene, output_root / "teacher_reference", output_root)
+
+    if args.prepare_only:
+        print("Teacher preparation complete; no training or test evaluation was run.", flush=True)
+        return
 
     # Keep splitting through 75% of a 15k run, while leaving a final refinement
     # window. Detail tiers use lower thresholds and gentler opacity pruning.
@@ -383,6 +430,27 @@ def main():
                     "--semantic_contrastive_every", 4,
                     "--semantic_chunks_per_step", 3,
                 ]
+                if args.semantic_protocol == "v5":
+                    # Later scalar flags intentionally override legacy defaults.
+                    # Affinity is disjoint from language; global prototype and
+                    # CLIP mask-negative losses are disabled by this protocol.
+                    command.extend([
+                        "--semantic_protocol", "v5", "--affinity_dimensions", 16,
+                        "--affinity_weight", 0.05, "--affinity_every", 4,
+                        "--affinity_samples", 320,
+                        "--semantic_clip_cosine_weight", 0.1,
+                        "--semantic_clip_cosine_every", 8,
+                        "--semantic_region_balance_power", 0.5,
+                        "--semantic_region_balance_cap", 8,
+                        "--semantic_weight", 0.12, "--semantic_lr", 0.005,
+                        "--rgb_tier_weights", 0.75, 1.0, 2.0,
+                        "--semantic_tier_weights", 0.5, 1.0, 2.0,
+                        "--tier_densify_multipliers", 1.15, 0.8, 0.5,
+                        "--tier_opacity_multipliers", 1.0, 0.7, 0.35,
+                        "--semantic_cross_view_weight", 0.0,
+                        "--semantic_contrastive_weight", 0.0,
+                        "--semantic_boundary_weight", 0.06,
+                    ])
                 checkpoint = latest_checkpoint(joint, args.iterations)
                 if args.resume and checkpoint is not None:
                     command.extend(("--start_checkpoint", checkpoint))
@@ -415,6 +483,11 @@ def main():
                     *common_train, "--foreground_weight", 3.0,
                     "--background_weight", 0.75,
                 ]
+                if args.semantic_protocol == "v5":
+                    # RGB comparator uses uniform photometric supervision, not
+                    # the historical importance-weighted RGB "baseline".
+                    command.extend(["--importance_mask_dir", "", "--foreground_weight", 1.0,
+                                    "--background_weight", 1.0, "--sh_degree", 3])
                 checkpoint = latest_checkpoint(baseline, args.iterations)
                 if args.resume and checkpoint is not None:
                     command.extend(("--start_checkpoint", checkpoint))
@@ -481,6 +554,8 @@ def main():
             "--iteration", args.iterations, "--threshold", 0.25,
             "--granularity", 1, "--output", output,
             "--important_labels", IMPORTANT, "--normal_labels", NORMAL,
+            *(["--score_mode", "clip_relevancy", "--mask_protocol", "gg_native", "--threshold", 0.5]
+              if args.semantic_protocol == "v5" else []),
         ], repo)
         results[name] = json.loads((output / "metrics.json").read_text())
 
@@ -496,6 +571,9 @@ def main():
         "semantic_iterations_baseline": args.semantic_iterations,
         "protocol": {
             **protocol,
+            "semantic_protocol": args.semantic_protocol,
+            "baseline_definition": "uniform_RGB_then_posthoc_semantics" if args.semantic_protocol == "v5" else "importance_weighted_RGB_then_posthoc_semantics",
+            "teacher_preprocessing_in_training_time": False,
             "requested_iteration_cap": args.iterations,
             "validation_views": len(validation_images),
             "validation_interval": args.validation_interval,
